@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -45,6 +46,8 @@ Commands:
 /effort <low|medium|high|xhigh|max> — set reasoning effort (persists)
 /voice <msg> — reply with a voice note
 /status — session, model, effort, uptime
+/ls [path] — list VM files
+/stats — VM + git repo status
 /cancel — stop the current task
 /restart — restart me
 /help — this
@@ -174,6 +177,16 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 			b.send(ctx, m.Chat.ID, helpText)
 		case "/status":
 			b.send(ctx, m.Chat.ID, b.statusText())
+		case "/ls":
+			path := firstArg(text, fields[0])
+			if path == "" {
+				path = b.cfg.WorkDir
+			}
+			out := b.runCmd(ctx, "ls", "-lah", "--group-directories-first", "--", path)
+			b.reply(ctx, m.Chat.ID, "```\n"+out+"\n```")
+		case "/stats":
+			out := b.runCmd(ctx, "bash", "-c", statsScript)
+			b.reply(ctx, m.Chat.ID, "```\n"+out+"\n```")
 		case "/newsession":
 			st, err := b.store.New()
 			if err != nil {
@@ -511,6 +524,8 @@ func (b *Bot) registerCommands(ctx context.Context) {
 		{Command: "effort", Description: "Set reasoning effort (low/medium/high/xhigh/max)"},
 		{Command: "voice", Description: "Reply with a voice note: /voice <message>"},
 		{Command: "status", Description: "Show session, model, effort, uptime"},
+		{Command: "ls", Description: "List VM files: /ls [path]"},
+		{Command: "stats", Description: "VM + git repo status"},
 		{Command: "cancel", Description: "Cancel the current task"},
 		{Command: "restart", Description: "Restart the daemon"},
 		{Command: "help", Description: "Show help"},
@@ -550,6 +565,52 @@ func firstArg(text, cmdToken string) string {
 	}
 	return strings.Fields(rest)[0]
 }
+
+// runCmd runs a command (cwd = workdir) with a 30s timeout and returns combined output.
+func (b *Bot) runCmd(parent context.Context, name string, args ...string) string {
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = b.cfg.WorkDir
+	out, err := cmd.CombinedOutput()
+	s := strings.TrimSpace(string(out))
+	if err != nil {
+		if s != "" {
+			s += "\n"
+		}
+		s += "⚠️ " + err.Error()
+	}
+	if s == "" {
+		s = "(no output)"
+	}
+	return s
+}
+
+// statsScript gathers VM + git-repo status for /stats.
+const statsScript = `
+echo "🖥️  VM"
+echo "uptime: $(uptime -p | sed 's/^up //')"
+echo "load:   $(cut -d' ' -f1-3 /proc/loadavg)"
+free -h | awk 'NR==1 || /^Mem:/ {print}'
+df -h / | awk 'NR==1 || NR==2 {print}'
+echo
+echo "🔧 services"
+for s in zoro franky daph; do printf "  %-7s %s\n" "$s" "$(systemctl is-active $s 2>/dev/null)"; done
+echo
+echo "📦 git repos under /home/rafael (dirty / unpushed)"
+found=0
+for d in $(find /home/rafael -maxdepth 3 -type d -name .git -not -path '*/node_modules/*' 2>/dev/null); do
+  r=$(dirname "$d")
+  dirty=$(git -C "$r" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  branch=$(git -C "$r" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  ahead=$(git -C "$r" rev-list --count '@{u}..HEAD' 2>/dev/null || echo '-')
+  if [ "$dirty" != "0" ] || { [ "$ahead" != "0" ] && [ "$ahead" != "-" ]; }; then
+    printf "  • %-22s [%s] uncommitted:%s unpushed:%s\n" "${r#/home/rafael/}" "$branch" "$dirty" "$ahead"
+    found=1
+  fi
+done
+if [ "$found" = "0" ]; then echo "  ✅ todo limpio y al día"; fi
+`
 
 func onoff(v bool) string {
 	if v {
