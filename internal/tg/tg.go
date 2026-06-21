@@ -79,6 +79,9 @@ type Message struct {
 	Document  *Document   `json:"document"`
 	Voice     *Voice      `json:"voice"`
 	Audio     *Audio      `json:"audio"`
+	// MediaGroupID is set by Telegram when this message is one item of an album
+	// (several photos sent together). All items of one album share the same id.
+	MediaGroupID string `json:"media_group_id"`
 }
 
 type User struct {

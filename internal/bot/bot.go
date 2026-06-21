@@ -12,10 +12,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
 	"zoro/internal/claude"
+	"zoro/internal/collector"
 	"zoro/internal/config"
 	"zoro/internal/media"
 	"zoro/internal/session"
@@ -72,23 +74,31 @@ type Bot struct {
 
 	startedAt time.Time
 	jobs      chan job
+	quit      chan struct{}
+	collector *collector.Collector
 
 	mu        sync.Mutex
 	cancelCur context.CancelFunc
 	lastCost  float64
+	busy      atomic.Bool // true while a turn is being processed
 }
 
 type job struct {
 	chatID    int64
-	msg       *tg.Message // set for normal messages (attachments ingested in worker)
-	prompt    string      // pre-built prompt for synthetic jobs (/compact, /voice)
+	msgs      []*tg.Message // content messages for a turn (album/burst already coalesced)
+	prompt    string        // pre-built prompt for synthetic jobs (/compact, /voice)
 	wantVoice bool
 	isCompact bool
 }
 
+// collectWindow is how long the collector waits for more messages before
+// flushing a chat's buffer as one turn — long enough to gather an album or a
+// quick multi-bubble thought, short enough to feel instant for a lone message.
+const collectWindow = 700 * time.Millisecond
+
 // New constructs a Bot.
 func New(cfg config.Config, log *slog.Logger, store *session.Store, set *settings.Store) *Bot {
-	return &Bot{
+	b := &Bot{
 		cfg:   cfg,
 		log:   log,
 		tg:    tg.New(cfg.Token),
@@ -111,7 +121,13 @@ func New(cfg config.Config, log *slog.Logger, store *session.Store, set *setting
 		aliveFile: filepath.Join(cfg.StateDir, "alive"),
 		startedAt: time.Now(),
 		jobs:      make(chan job, 16),
+		quit:      make(chan struct{}),
 	}
+	// Coalesce albums and quick bursts into a single turn (see internal/collector).
+	b.collector = collector.New(collectWindow, func(chatID int64, msgs []*tg.Message) {
+		b.enqueue(job{chatID: chatID, msgs: msgs})
+	})
+	return b
 }
 
 // Run starts the worker and the long-poll loop until ctx is cancelled, then drains
@@ -168,7 +184,8 @@ func (b *Bot) Run(ctx context.Context) error {
 	// Graceful shutdown: notify, stop accepting new work, finish queued/in-flight, mark clean.
 	b.log.Info("draining before shutdown")
 	b.notify("💤 zoro deteniéndose… (si es un reinicio, vuelvo en unos segundos)")
-	close(b.jobs)
+	b.collector.Stop() // stop buffering new input; queued jobs still drain below
+	close(b.quit)
 	<-workerDone
 	_ = os.Remove(b.aliveFile)
 	return ctx.Err()
@@ -202,6 +219,10 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 			out := b.runCmd(ctx, "bash", "-c", statsScript)
 			b.reply(ctx, m.Chat.ID, "```\n"+out+"\n```")
 		case "/newsession":
+			if b.busy.Load() {
+				b.send(ctx, m.Chat.ID, "⏳ Hay un turno corriendo. Usa /cancel o espera a que termine, luego /newsession.")
+				return
+			}
 			st, err := b.store.New()
 			if err != nil {
 				b.send(ctx, m.Chat.ID, "⚠️ "+err.Error())
@@ -209,9 +230,18 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 			}
 			b.send(ctx, m.Chat.ID, "🔄 New session — fresh memory.\n"+st.SessionID)
 		case "/cancel":
+			discarded := b.collector.Drop(m.Chat.ID) + b.drainJobs()
 			b.cancel()
-			b.send(ctx, m.Chat.ID, "✋ Cancelled the current task (if any).")
+			reply := "✋ Cancelled the current task (if any)."
+			if discarded > 0 {
+				reply += fmt.Sprintf(" Dropped %d queued message(s) too.", discarded)
+			}
+			b.send(ctx, m.Chat.ID, reply)
 		case "/restart":
+			if b.busy.Load() {
+				b.send(ctx, m.Chat.ID, "⏳ Hay un turno corriendo. Usa /cancel primero o espera a que termine, luego /restart.")
+				return
+			}
 			b.send(ctx, m.Chat.ID, "♻️ Reiniciando…")
 			go func() {
 				time.Sleep(500 * time.Millisecond)
@@ -261,14 +291,19 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 			b.enqueue(job{chatID: m.Chat.ID, prompt: rest, wantVoice: true})
 		default:
 			// Unknown slash command → pass it through to Claude (its own skills,
-			// e.g. /deep-research, /code-review, run inside the turn).
-			b.enqueue(job{chatID: m.Chat.ID, msg: m})
+			// e.g. /deep-research, /code-review, run inside the turn). Bypass the
+			// collector so a command isn't merged with unrelated buffered media.
+			b.enqueue(job{chatID: m.Chat.ID, msgs: []*tg.Message{m}})
 		}
 		return
 	}
 
-	// Normal message → run as a turn (attachments ingested in the worker).
-	b.enqueue(job{chatID: m.Chat.ID, msg: m})
+	// Normal message → show "typing…" right away (the collector adds a short
+	// debounce before the turn starts, so without this the indicator would lag),
+	// then buffer it. The collector coalesces albums and quick bursts into a
+	// single turn before enqueuing (see internal/collector).
+	go b.tg.SendChatAction(context.Background(), m.Chat.ID, tg.ActionTyping)
+	b.collector.Add(m)
 }
 
 func (b *Bot) enqueue(j job) {
@@ -285,8 +320,23 @@ func (b *Bot) enqueue(j job) {
 // worker runs jobs one at a time on a background context so an in-flight turn
 // survives SIGTERM and completes during the graceful drain in Run.
 func (b *Bot) worker() {
-	for j := range b.jobs {
-		b.process(context.Background(), j)
+	for {
+		select {
+		case j := <-b.jobs:
+			b.process(context.Background(), j)
+		case <-b.quit:
+			// Shutting down: finish whatever is already queued, then stop. An
+			// in-flight turn runs on context.Background() and completes; new input
+			// is no longer buffered because the collector was stopped first.
+			for {
+				select {
+				case j := <-b.jobs:
+					b.process(context.Background(), j)
+				default:
+					return
+				}
+			}
+		}
 	}
 }
 
@@ -302,6 +352,9 @@ func (b *Bot) process(parent context.Context, j job) {
 		b.mu.Unlock()
 	}()
 
+	b.busy.Store(true)
+	defer b.busy.Store(false)
+
 	wantVoice := j.wantVoice
 
 	// Start the typing/recording indicator IMMEDIATELY so it also covers media
@@ -314,16 +367,16 @@ func (b *Bot) process(parent context.Context, j job) {
 	defer stopTyping()
 
 	prompt := j.prompt
-	if j.msg != nil {
-		in, err := media.Ingest(ctx, b.mediaC, b.tg, j.msg)
+	if len(j.msgs) > 0 {
+		p, notes, err := b.ingestMessages(ctx, j.msgs)
 		if err != nil {
 			b.send(parent, j.chatID, "⚠️ media error: "+err.Error())
 			return
 		}
-		for _, n := range in.Notes {
+		for _, n := range notes {
 			b.send(parent, j.chatID, n)
 		}
-		prompt = buildPrompt(j.msg, in)
+		prompt = p
 		// Text by default: understanding a voice note does NOT force a voice reply.
 		// Audio replies happen only on explicit request (/voice or the send-audio skill).
 	}
@@ -439,7 +492,18 @@ func (b *Bot) sendOutbox(ctx context.Context, chatID int64, before map[string]ti
 		var err error
 		switch ext {
 		case "jpg", "jpeg", "png", "webp", "gif":
-			err = b.tg.SendPhoto(ctx, chatID, f, "")
+			// Shrink oversized images first, then route by size: Telegram's
+			// sendPhoto silently rejects files over 10 MiB, so anything still
+			// above that goes out as a document (preserved, up to 50 MiB).
+			send := media.OptimizeImage(f)
+			if fi, serr := os.Stat(send); serr == nil && fi.Size() > media.PhotoMaxBytes {
+				err = b.tg.SendDocument(ctx, chatID, send, "")
+			} else {
+				err = b.tg.SendPhoto(ctx, chatID, send, "")
+			}
+			if send != f {
+				os.Remove(send)
+			}
 		case "ogg", "oga":
 			err = b.tg.SendVoice(ctx, chatID, f, "")
 		default:
@@ -476,6 +540,21 @@ func (b *Bot) cancel() {
 	b.mu.Unlock()
 	if c != nil {
 		c()
+	}
+}
+
+// drainJobs removes every queued (not-yet-started) job without running it and
+// returns how many were dropped. The in-flight turn, if any, is stopped
+// separately via cancel.
+func (b *Bot) drainJobs() int {
+	n := 0
+	for {
+		select {
+		case <-b.jobs:
+			n++
+		default:
+			return n
+		}
 	}
 }
 
@@ -556,26 +635,52 @@ func (b *Bot) registerCommands(ctx context.Context) {
 	}
 }
 
-func buildPrompt(m *tg.Message, in media.Incoming) string {
-	var parts []string
-	txt := strings.TrimSpace(m.Text)
-	if txt == "" {
-		txt = strings.TrimSpace(m.Caption)
-	}
-	if in.Transcript != "" {
-		if txt != "" {
-			parts = append(parts, txt)
+// ingestMessages downloads every message's attachments and assembles one turn
+// prompt: concatenated texts/captions, then any voice transcripts, then a single
+// line listing all attached files. Notes (skipped files, transcription errors)
+// are returned for the caller to surface to the user.
+func (b *Bot) ingestMessages(ctx context.Context, msgs []*tg.Message) (prompt string, notes []string, err error) {
+	var texts, transcripts, files []string
+	for _, m := range msgs {
+		in, ierr := media.Ingest(ctx, b.mediaC, b.tg, m)
+		if ierr != nil {
+			return "", nil, ierr
 		}
-		parts = append(parts, "[Voice note transcript]: "+in.Transcript)
-	} else if txt != "" {
-		parts = append(parts, txt)
+		if t := msgText(m); t != "" {
+			texts = append(texts, t)
+		}
+		files = append(files, in.Files...)
+		notes = append(notes, in.Notes...)
+		if in.Transcript != "" {
+			transcripts = append(transcripts, in.Transcript)
+		}
 	}
-	if len(in.Files) > 0 {
+	return buildPrompt(texts, transcripts, files), notes, nil
+}
+
+// buildPrompt assembles the user-visible turn text from its collected parts.
+func buildPrompt(texts, transcripts, files []string) string {
+	var parts []string
+	if t := strings.Join(texts, "\n\n"); t != "" {
+		parts = append(parts, t)
+	}
+	for _, tr := range transcripts {
+		parts = append(parts, "[Voice note transcript]: "+tr)
+	}
+	if len(files) > 0 {
 		parts = append(parts, fmt.Sprintf(
 			"[The user attached %d file(s). Use the Read tool to view them: %s]",
-			len(in.Files), strings.Join(in.Files, ", ")))
+			len(files), strings.Join(files, ", ")))
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+// msgText returns a message's text, falling back to its caption.
+func msgText(m *tg.Message) string {
+	if t := strings.TrimSpace(m.Text); t != "" {
+		return t
+	}
+	return strings.TrimSpace(m.Caption)
 }
 
 // firstArg returns the first whitespace-separated argument after cmdToken in text.
