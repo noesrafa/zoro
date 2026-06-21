@@ -50,6 +50,7 @@ Commands:
 /ls [path] — list VM files
 /stats — VM + git repo status
 /cancel — stop the current task
+/redeploy — rebuild my code + restart (apply changes)
 /restart — restart me
 /help — this
 
@@ -65,8 +66,9 @@ type Bot struct {
 	store  *session.Store
 	set    *settings.Store
 	tts    tts.Config
-	mediaC media.Config
-	ttsDir string
+	mediaC    media.Config
+	ttsDir    string
+	aliveFile string // state/alive — present while running; removed on clean shutdown
 
 	startedAt time.Time
 	jobs      chan job
@@ -106,6 +108,7 @@ func New(cfg config.Config, log *slog.Logger, store *session.Store, set *setting
 			STT:          stt.Config{WhisperBin: cfg.WhisperBin, WhisperModel: cfg.WhisperModel, Lang: cfg.WhisperLang, FFmpegBin: cfg.FFmpegBin},
 		},
 		ttsDir:    filepath.Join(cfg.StateDir, "tts"),
+		aliveFile: filepath.Join(cfg.StateDir, "alive"),
 		startedAt: time.Now(),
 		jobs:      make(chan job, 16),
 	}
@@ -117,6 +120,14 @@ func New(cfg config.Config, log *slog.Logger, store *session.Store, set *setting
 func (b *Bot) Run(ctx context.Context) error {
 	b.registerCommands(ctx)
 
+	// Lifecycle: if the alive file lingered, the previous run crashed (didn't shut down
+	// cleanly). Mark ourselves running now.
+	crashed := false
+	if _, err := os.Stat(b.aliveFile); err == nil {
+		crashed = true
+	}
+	_ = os.WriteFile(b.aliveFile, []byte(time.Now().UTC().Format(time.RFC3339)), 0o644)
+
 	workerDone := make(chan struct{})
 	go func() {
 		b.worker()
@@ -126,6 +137,11 @@ func (b *Bot) Run(ctx context.Context) error {
 	b.log.Info("zoro online",
 		"owner", b.cfg.OwnerID, "workdir", b.cfg.WorkDir, "model", b.cfg.ClaudeModel,
 		"stt", b.mediaC.STT.Available(), "tts", b.tts.Available())
+	if crashed {
+		b.notify("⚠️ zoro revivió — el run anterior se cayó. Ya regresé ⚔️")
+	} else {
+		b.notify("⚡ zoro online ⚔️")
+	}
 
 	offset := 0
 	for ctx.Err() == nil {
@@ -149,10 +165,12 @@ func (b *Bot) Run(ctx context.Context) error {
 		}
 	}
 
-	// Graceful shutdown: stop accepting new work, finish what's queued / in-flight.
+	// Graceful shutdown: notify, stop accepting new work, finish queued/in-flight, mark clean.
 	b.log.Info("draining before shutdown")
+	b.notify("💤 zoro deteniéndose… (si es un reinicio, vuelvo en unos segundos)")
 	close(b.jobs)
 	<-workerDone
+	_ = os.Remove(b.aliveFile)
 	return ctx.Err()
 }
 
@@ -194,8 +212,14 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 			b.cancel()
 			b.send(ctx, m.Chat.ID, "✋ Cancelled the current task (if any).")
 		case "/restart":
-			b.send(ctx, m.Chat.ID, "♻️ Restarting…")
-			go func() { time.Sleep(500 * time.Millisecond); os.Exit(0) }()
+			b.send(ctx, m.Chat.ID, "♻️ Reiniciando…")
+			go func() {
+				time.Sleep(500 * time.Millisecond)
+				_ = os.Remove(b.aliveFile) // clean marker so next start isn't reported as a crash
+				os.Exit(0)
+			}()
+		case "/redeploy":
+			go b.redeploy(m.Chat.ID)
 		case "/compact":
 			b.enqueue(job{chatID: m.Chat.ID, prompt: "/compact", isCompact: true})
 		case "/model":
@@ -523,6 +547,7 @@ func (b *Bot) registerCommands(ctx context.Context) {
 		{Command: "ls", Description: "List VM files: /ls [path]"},
 		{Command: "stats", Description: "VM + git repo status"},
 		{Command: "cancel", Description: "Cancel the current task"},
+		{Command: "redeploy", Description: "Rebuild engine + restart (apply code changes)"},
 		{Command: "restart", Description: "Restart the daemon"},
 		{Command: "help", Description: "Show help"},
 	}
@@ -560,6 +585,33 @@ func firstArg(text, cmdToken string) string {
 		return ""
 	}
 	return strings.Fields(rest)[0]
+}
+
+// notify sends a lifecycle message to the owner, out-of-band of any turn.
+func (b *Bot) notify(text string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := b.tg.SendMessage(ctx, b.cfg.OwnerID, text, ""); err != nil {
+		b.log.Warn("notify failed", "err", err)
+	}
+}
+
+// redeploy rebuilds the engine and, on success, restarts the daemon (detached so the
+// reply lands first). On build failure it reports the error and does NOT restart.
+func (b *Bot) redeploy(chatID int64) {
+	b.send(context.Background(), chatID, "🔧 Rebuilding zoro…")
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/usr/local/go/bin/go", "build", "-o", "bin/zoro", "./cmd/zoro")
+	cmd.Dir = b.cfg.EngineDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		b.send(context.Background(), chatID, "❌ Build falló — NO reinicio:\n"+truncate(strings.TrimSpace(string(out)), 1500))
+		return
+	}
+	b.send(context.Background(), chatID, "✅ Build OK — aplicando (reinicio)…")
+	// Detached restart: survives this process exiting; systemd brings up the new binary,
+	// and the lifecycle messages (💤 → ⚡) confirm it.
+	_ = exec.Command("setsid", "bash", "-c", "sleep 1; sudo systemctl restart zoro >/dev/null 2>&1").Start()
 }
 
 // listDir returns a clean, scannable listing: dirs first (📁), then files (📄), names only.

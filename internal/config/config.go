@@ -20,6 +20,7 @@ type Config struct {
 	ClaudeModel string
 	Effort      string
 	WorkDir     string
+	EngineDir   string // where zoro's own Go source lives (for /redeploy build)
 	DangerSkip  bool
 
 	// Agent content lives OUTSIDE the engine, in ~/.zoro (its own git repo).
@@ -53,6 +54,7 @@ func Load() (Config, error) {
 		ClaudeModel:  getenv("CLAUDE_MODEL", "opus"),
 		Effort:       getenv("ZORO_EFFORT", "high"),
 		WorkDir:      getenv("ZORO_WORK_DIR", "/home/rafael"),
+		EngineDir:    getenv("ZORO_ENGINE_DIR", "/home/rafael/zoro"),
 		DangerSkip:   getbool("ZORO_DANGER_SKIP", true),
 		ZoroHome:     getenv("ZORO_HOME", "/home/rafael/.zoro"),
 		StateDir:     getenv("ZORO_STATE_DIR", "/home/rafael/zoro/state"),
