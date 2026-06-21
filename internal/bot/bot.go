@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -324,7 +325,7 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 				b.fireCron(j)
 				return
 			}
-			b.send(ctx, m.Chat.ID, b.cronList())
+			b.reply(ctx, m.Chat.ID, b.cronList())
 		default:
 			// Unknown slash command → pass it through to Claude (its own skills,
 			// e.g. /deep-research, /code-review, run inside the turn). Bypass the
@@ -771,46 +772,120 @@ func (b *Bot) fireCron(j cron.Job) {
 	b.enqueue(job{chatID: b.cfg.OwnerID, prompt: prompt})
 }
 
-// findCron loads crons.json and returns the entry with the given id.
-func (b *Bot) findCron(id string) (cron.Job, bool) {
+// findCron loads crons.json and returns the entry matching ref, which can be a
+// 1-based list number (e.g. "2") or the slug id (e.g. "gastos-hoy").
+func (b *Bot) findCron(ref string) (cron.Job, bool) {
 	f, err := cron.Load(b.cfg.CronFile)
 	if err != nil {
 		return cron.Job{}, false
 	}
+	if n, err := strconv.Atoi(ref); err == nil { // numeric position
+		if n >= 1 && n <= len(f.Crons) {
+			return f.Crons[n-1], true
+		}
+		return cron.Job{}, false
+	}
 	for _, j := range f.Crons {
-		if j.ID == id {
+		if j.ID == ref {
 			return j, true
 		}
 	}
 	return cron.Job{}, false
 }
 
-// cronList renders the configured crons with their next run time (CDMX).
+// cronList renders the configured crons as a clean, numbered list (Markdown).
+// The number is what /crons <n> fires, so it doubles as a quick-fire index.
 func (b *Bot) cronList() string {
 	f, err := cron.Load(b.cfg.CronFile)
 	if err != nil {
 		return "⚠️ crons.json: " + err.Error()
 	}
 	if len(f.Crons) == 0 {
-		return "📭 No hay crons configurados.\nCrea " + b.cfg.CronFile + " (lista de {id, schedule, prompt, enabled})."
+		return "📭 No tienes crons todavía.\nSe definen en `" + b.cfg.CronFile + "`."
 	}
 	loc := f.Location()
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "⏰ Crons — zona %s\n\n", f.Timezone)
-	for _, j := range f.Crons {
-		status := "✅"
+	sb.WriteString("⏰ *Tus crons* · horario CDMX\n")
+	sb.WriteString("──────────────\n")
+	for i, j := range f.Crons {
+		dot := "🟢"
 		if !j.Enabled {
-			status = "⏸️ off"
+			dot = "⚪️"
 		}
-		fmt.Fprintf(&sb, "%s  %s  [%s]\n", status, j.ID, j.Schedule)
-		if runs, rerr := cron.NextRuns(j, loc, 1); rerr != nil {
-			sb.WriteString("   ⚠️ schedule inválido\n")
-		} else if len(runs) > 0 {
-			fmt.Fprintf(&sb, "   próxima: %s\n", runs[0].Format("Mon 02 Jan 15:04"))
+		fmt.Fprintf(&sb, "\n*%d.* %s  *%s*\n", i+1, dot, j.ID)
+		fmt.Fprintf(&sb, "🗓 %s", humanWhen(j.Schedule))
+		if runs, rerr := cron.NextRuns(j, loc, 1); rerr == nil && len(runs) > 0 {
+			fmt.Fprintf(&sb, "  ·  próxima: %s", humanNext(runs[0], loc))
 		}
-		fmt.Fprintf(&sb, "   “%s”\n\n", truncate(j.Prompt, 90))
+		fmt.Fprintf(&sb, "\n💬 %s\n", truncate(oneLine(j.Prompt), 90))
 	}
-	return strings.TrimRight(sb.String(), "\n")
+	sb.WriteString("\n──────────────\n")
+	fmt.Fprintf(&sb, "_Dispara uno ya:_ `/crons 1`  _o_  `/crons %s`", f.Crons[0].ID)
+	return sb.String()
+}
+
+// humanWhen turns a 5-field cron spec into plain Spanish ("todos los días 8:30",
+// "martes 6:30", "L–V 9:00"). Falls back to the raw spec for exotic schedules.
+func humanWhen(schedule string) string {
+	p := strings.Fields(schedule)
+	if len(p) != 5 {
+		return schedule
+	}
+	hm := schedule
+	if h, e1 := strconv.Atoi(p[1]); e1 == nil {
+		if m, e2 := strconv.Atoi(p[0]); e2 == nil {
+			hm = fmt.Sprintf("%d:%02d", h, m)
+		}
+	}
+	when := "todos los días"
+	if p[2] == "*" && p[3] == "*" {
+		switch p[4] {
+		case "*":
+			when = "todos los días"
+		case "1-5":
+			when = "L–V"
+		case "6-0", "0,6", "6,0":
+			when = "fines de semana"
+		case "0", "7":
+			when = "domingos"
+		case "1":
+			when = "lunes"
+		case "2":
+			when = "martes"
+		case "3":
+			when = "miércoles"
+		case "4":
+			when = "jueves"
+		case "5":
+			when = "viernes"
+		case "6":
+			when = "sábados"
+		default:
+			when = "días " + p[4]
+		}
+	}
+	return when + " " + hm
+}
+
+// humanNext renders the next run relative to now ("hoy 22:30", "mañana 08:30").
+func humanNext(t time.Time, loc *time.Location) string {
+	now := time.Now().In(loc)
+	y1, m1, d1 := t.Date()
+	y2, m2, d2 := now.Date()
+	y3, m3, d3 := now.AddDate(0, 0, 1).Date()
+	switch {
+	case y1 == y2 && m1 == m2 && d1 == d2:
+		return "hoy " + t.Format("15:04")
+	case y1 == y3 && m1 == m3 && d1 == d3:
+		return "mañana " + t.Format("15:04")
+	default:
+		return t.Format("02 Jan 15:04")
+	}
+}
+
+// oneLine collapses whitespace/newlines so a prompt fits on one summary line.
+func oneLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // redeploy rebuilds the engine and, on success, restarts the daemon (detached so the
