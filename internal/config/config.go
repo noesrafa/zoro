@@ -27,6 +27,7 @@ type Config struct {
 	ZoroHome    string // ~/.zoro
 	SoulFile    string // ~/.zoro/soul.md — always injected (every turn), read fresh
 	ContextFile string // ~/.zoro/context.md — injected once at the start of each session
+	CronFile    string // ~/.zoro/crons.json — scheduled messages (hot-reloaded)
 
 	StateDir  string
 	InboxDir  string
@@ -70,6 +71,7 @@ func Load() (Config, error) {
 	}
 	c.SoulFile = getenv("ZORO_SOUL_FILE", filepath.Join(c.ZoroHome, "soul.md"))
 	c.ContextFile = getenv("ZORO_CONTEXT_FILE", filepath.Join(c.ZoroHome, "context.md"))
+	c.CronFile = getenv("ZORO_CRON_FILE", filepath.Join(c.ZoroHome, "crons.json"))
 
 	if id := getenv("TELEGRAM_OWNER_ID", ""); id != "" {
 		v, err := strconv.ParseInt(id, 10, 64)

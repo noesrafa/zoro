@@ -115,7 +115,14 @@ func (d *Driver) Run(ctx context.Context, sessionID string, create bool, prompt 
 				res.SessionID = ev.SessionID
 			}
 		case "assistant":
-			assistant.WriteString(extractText(ev.Message))
+			// Acumulamos CADA bloque de texto del turno, separando con doble
+			// salto los mensajes distintos (los que van entre tool calls).
+			if t := strings.TrimSpace(extractText(ev.Message)); t != "" {
+				if assistant.Len() > 0 {
+					assistant.WriteString("\n\n")
+				}
+				assistant.WriteString(t)
+			}
 		case "result":
 			res.Subtype = ev.Subtype
 			res.IsError = ev.IsError
@@ -134,8 +141,13 @@ func (d *Driver) Run(ctx context.Context, sessionID string, create bool, prompt 
 	if scErr := sc.Err(); scErr != nil && waitErr == nil {
 		waitErr = scErr
 	}
-	if res.Text == "" {
-		res.Text = strings.TrimSpace(assistant.String())
+	// A Telegram debe ir TODO lo que dije en el turno — cada bloque de texto,
+	// incluidos los emitidos ANTES de un tool call. El evento "result" del CLI
+	// solo trae el ÚLTIMO bloque, así que preferirlo tiraba los mensajes
+	// intermedios (ese era el bug: respuestas que "no llegaban" a Telegram).
+	// Usamos el acumulado completo; result queda solo como fallback.
+	if full := strings.TrimSpace(assistant.String()); full != "" {
+		res.Text = full
 	}
 	if waitErr != nil {
 		return res, fmt.Errorf("claude exited: %v: %s", waitErr, strings.TrimSpace(stderr.String()))

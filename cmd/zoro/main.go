@@ -22,6 +22,16 @@ func main() {
 		log.Error("config", "err", err)
 		os.Exit(1)
 	}
+
+	// Subcommands (one-shot, no daemon): `zoro cron list|fire <id>`.
+	if len(os.Args) > 1 && os.Args[1] == "cron" {
+		if err := runCron(cfg, os.Args[2:]); err != nil {
+			log.Error("cron", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	for _, d := range []string{cfg.StateDir, cfg.InboxDir, cfg.OutboxDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			log.Error("mkdir", "dir", d, "err", err)

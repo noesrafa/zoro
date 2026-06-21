@@ -19,6 +19,7 @@ import (
 	"zoro/internal/claude"
 	"zoro/internal/collector"
 	"zoro/internal/config"
+	"zoro/internal/cron"
 	"zoro/internal/media"
 	"zoro/internal/session"
 	"zoro/internal/settings"
@@ -26,6 +27,7 @@ import (
 	"zoro/internal/tg"
 	"zoro/internal/tgfmt"
 	"zoro/internal/tts"
+	"zoro/internal/uid"
 )
 
 var validEfforts = map[string]bool{"low": true, "medium": true, "high": true, "xhigh": true, "max": true}
@@ -48,6 +50,9 @@ Commands:
 /model <opus|sonnet|haiku|fable|claude-…> — switch model (persists)
 /effort <low|medium|high|xhigh|max> — set reasoning effort (persists)
 /voice <msg> — reply with a voice note
+/btw <question> — quick side-question (parallel Sonnet, won't touch this chat)
+/crons — list scheduled messages (and next run)
+/crons <id> — fire that scheduled message now
 /status — session, model, effort, uptime
 /ls [path] — list VM files
 /stats — VM + git repo status
@@ -149,6 +154,10 @@ func (b *Bot) Run(ctx context.Context) error {
 		b.worker()
 		close(workerDone)
 	}()
+
+	// Cron scheduler: once a minute, fires due prompts from ~/.zoro/crons.json
+	// (CDMX timezone, hot-reloaded). Each fire enqueues a normal turn.
+	go cron.Run(ctx, b.cfg.CronFile, b.fireCron, b.log)
 
 	b.log.Info("zoro online",
 		"owner", b.cfg.OwnerID, "workdir", b.cfg.WorkDir, "model", b.cfg.ClaudeModel,
@@ -289,6 +298,33 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 				return
 			}
 			b.enqueue(job{chatID: m.Chat.ID, prompt: rest, wantVoice: true})
+		case "/btw":
+			// Quick side-question: runs in parallel on a throwaway Sonnet session,
+			// so it never touches or blocks the main conversation.
+			rest := strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
+			if rest == "" {
+				b.send(ctx, m.Chat.ID, "Uso: /btw <pregunta> — consulta rápida en paralelo (no toca tu hilo principal).")
+				return
+			}
+			go b.handleBtw(m.Chat.ID, rest)
+		case "/crons", "/cron":
+			// /crons          → list scheduled messages + next run
+			// /crons <id>     → fire that cron right now (at the moment)
+			if len(fields) >= 2 {
+				id := fields[1]
+				if id == "test" && len(fields) >= 3 { // tolerate legacy "/cron test <id>"
+					id = fields[2]
+				}
+				j, ok := b.findCron(id)
+				if !ok {
+					b.send(ctx, m.Chat.ID, "⚠️ No encontré el cron \""+id+"\". Manda /crons para ver la lista.")
+					return
+				}
+				b.send(ctx, m.Chat.ID, "🧪 Disparando cron \""+j.ID+"\" ahora…")
+				b.fireCron(j)
+				return
+			}
+			b.send(ctx, m.Chat.ID, b.cronList())
 		default:
 			// Unknown slash command → pass it through to Claude (its own skills,
 			// e.g. /deep-research, /code-review, run inside the turn). Bypass the
@@ -622,6 +658,8 @@ func (b *Bot) registerCommands(ctx context.Context) {
 		{Command: "model", Description: "Switch model (opus/sonnet/haiku/fable/claude-…)"},
 		{Command: "effort", Description: "Set reasoning effort (low/medium/high/xhigh/max)"},
 		{Command: "voice", Description: "Reply with a voice note: /voice <message>"},
+		{Command: "btw", Description: "Quick side-question in parallel: /btw <question>"},
+		{Command: "crons", Description: "List scheduled messages and next run"},
 		{Command: "status", Description: "Show session, model, effort, uptime"},
 		{Command: "ls", Description: "List VM files: /ls [path]"},
 		{Command: "stats", Description: "VM + git repo status"},
@@ -699,6 +737,80 @@ func (b *Bot) notify(text string) {
 	if err := b.tg.SendMessage(ctx, b.cfg.OwnerID, text, ""); err != nil {
 		b.log.Warn("notify failed", "err", err)
 	}
+}
+
+// handleBtw answers a quick side-question in PARALLEL with the main worker: a
+// throwaway Sonnet session (not stored, not primed with context.md) so it stays
+// fast and never pollutes or blocks the main conversation. Runs in its own
+// goroutine straight from dispatch — outside the serialized job queue.
+func (b *Bot) handleBtw(chatID int64, question string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	stop := b.typingPump(ctx, chatID, tg.ActionTyping)
+	defer stop()
+
+	opts := claude.RunOpts{Model: "sonnet", Effort: "medium", SystemPrompt: b.systemPrompt()}
+	res, err := b.cd.Run(ctx, uid.New(), true, question, opts)
+	stop()
+	if err != nil {
+		b.send(ctx, chatID, "💭 btw → ⚠️ "+truncate(err.Error(), 800))
+		return
+	}
+	reply := strings.TrimSpace(res.Text)
+	if reply == "" {
+		reply = "(sin respuesta)"
+	}
+	b.reply(ctx, chatID, "💭 *btw* →\n\n"+reply)
+}
+
+// fireCron enqueues a scheduled job's prompt as a normal turn to the owner. The
+// wrapper tells the model this is an automatic trigger so it replies concisely.
+func (b *Bot) fireCron(j cron.Job) {
+	prompt := "[⏰ Cron automático \"" + j.ID + "\" — disparado a su hora programada (CDMX). " +
+		"Atiende esto y mándame el resultado de forma breve, como un recordatorio/aviso:]\n\n" + j.Prompt
+	b.enqueue(job{chatID: b.cfg.OwnerID, prompt: prompt})
+}
+
+// findCron loads crons.json and returns the entry with the given id.
+func (b *Bot) findCron(id string) (cron.Job, bool) {
+	f, err := cron.Load(b.cfg.CronFile)
+	if err != nil {
+		return cron.Job{}, false
+	}
+	for _, j := range f.Crons {
+		if j.ID == id {
+			return j, true
+		}
+	}
+	return cron.Job{}, false
+}
+
+// cronList renders the configured crons with their next run time (CDMX).
+func (b *Bot) cronList() string {
+	f, err := cron.Load(b.cfg.CronFile)
+	if err != nil {
+		return "⚠️ crons.json: " + err.Error()
+	}
+	if len(f.Crons) == 0 {
+		return "📭 No hay crons configurados.\nCrea " + b.cfg.CronFile + " (lista de {id, schedule, prompt, enabled})."
+	}
+	loc := f.Location()
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "⏰ Crons — zona %s\n\n", f.Timezone)
+	for _, j := range f.Crons {
+		status := "✅"
+		if !j.Enabled {
+			status = "⏸️ off"
+		}
+		fmt.Fprintf(&sb, "%s  %s  [%s]\n", status, j.ID, j.Schedule)
+		if runs, rerr := cron.NextRuns(j, loc, 1); rerr != nil {
+			sb.WriteString("   ⚠️ schedule inválido\n")
+		} else if len(runs) > 0 {
+			fmt.Fprintf(&sb, "   próxima: %s\n", runs[0].Format("Mon 02 Jan 15:04"))
+		}
+		fmt.Fprintf(&sb, "   “%s”\n\n", truncate(j.Prompt, 90))
+	}
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 // redeploy rebuilds the engine and, on success, restarts the daemon (detached so the
@@ -784,7 +896,7 @@ free -h | awk 'NR==1 || /^Mem:/ {print}'
 df -h / | awk 'NR==1 || NR==2 {print}'
 echo
 echo "🔧 services"
-for s in zoro franky daph; do printf "  %-7s %s\n" "$s" "$(systemctl is-active $s 2>/dev/null)"; done
+for s in zoro daph; do printf "  %-7s %s\n" "$s" "$(systemctl is-active $s 2>/dev/null)"; done
 echo
 echo "📦 git repos under /home/rafael (dirty / unpushed)"
 found=0
