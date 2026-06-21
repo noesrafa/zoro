@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -178,12 +179,7 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 		case "/status":
 			b.send(ctx, m.Chat.ID, b.statusText())
 		case "/ls":
-			path := firstArg(text, fields[0])
-			if path == "" {
-				path = b.cfg.WorkDir
-			}
-			out := b.runCmd(ctx, "ls", "-lah", "--group-directories-first", "--", path)
-			b.reply(ctx, m.Chat.ID, "```\n"+out+"\n```")
+			b.send(ctx, m.Chat.ID, b.listDir(firstArg(text, fields[0])))
 		case "/stats":
 			out := b.runCmd(ctx, "bash", "-c", statsScript)
 			b.reply(ctx, m.Chat.ID, "```\n"+out+"\n```")
@@ -564,6 +560,42 @@ func firstArg(text, cmdToken string) string {
 		return ""
 	}
 	return strings.Fields(rest)[0]
+}
+
+// listDir returns a clean, scannable listing: dirs first (📁), then files (📄), names only.
+func (b *Bot) listDir(path string) string {
+	if path == "" {
+		path = b.cfg.WorkDir
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(b.cfg.WorkDir, path)
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return "⚠️ " + err.Error()
+	}
+	var dirs, files []string
+	for _, e := range entries {
+		if e.IsDir() {
+			dirs = append(dirs, "📁 "+e.Name()+"/")
+		} else {
+			files = append(files, "📄 "+e.Name())
+		}
+	}
+	sort.Strings(dirs)
+	sort.Strings(files)
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "📂 %s  —  %d dirs · %d files\n\n", path, len(dirs), len(files))
+	for _, d := range dirs {
+		sb.WriteString(d + "\n")
+	}
+	if len(dirs) > 0 && len(files) > 0 {
+		sb.WriteString("\n")
+	}
+	for _, f := range files {
+		sb.WriteString(f + "\n")
+	}
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 // runCmd runs a command (cwd = workdir) with a 30s timeout and returns combined output.
