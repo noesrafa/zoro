@@ -107,28 +107,32 @@ func New(cfg config.Config, log *slog.Logger, store *session.Store, set *setting
 	}
 }
 
-// Run starts the worker and the long-poll loop until ctx is cancelled.
+// Run starts the worker and the long-poll loop until ctx is cancelled, then drains
+// queued + in-flight turns before returning, so a restart/SIGTERM never drops a
+// message that was already fetched from Telegram.
 func (b *Bot) Run(ctx context.Context) error {
 	b.registerCommands(ctx)
-	go b.worker(ctx)
+
+	workerDone := make(chan struct{})
+	go func() {
+		b.worker()
+		close(workerDone)
+	}()
+
 	b.log.Info("zoro online",
 		"owner", b.cfg.OwnerID, "workdir", b.cfg.WorkDir, "model", b.cfg.ClaudeModel,
 		"stt", b.mediaC.STT.Available(), "tts", b.tts.Available())
 
 	offset := 0
-	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
+	for ctx.Err() == nil {
 		ups, err := b.tg.GetUpdates(ctx, offset, 50)
 		if err != nil {
 			if ctx.Err() != nil {
-				return ctx.Err()
+				break
 			}
 			b.log.Warn("getUpdates failed", "err", err)
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
 			case <-time.After(3 * time.Second):
 			}
 			continue
@@ -140,6 +144,12 @@ func (b *Bot) Run(ctx context.Context) error {
 			b.dispatch(ctx, u)
 		}
 	}
+
+	// Graceful shutdown: stop accepting new work, finish what's queued / in-flight.
+	b.log.Info("draining before shutdown")
+	close(b.jobs)
+	<-workerDone
+	return ctx.Err()
 }
 
 func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
@@ -239,14 +249,11 @@ func (b *Bot) enqueue(j job) {
 	}
 }
 
-func (b *Bot) worker(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case j := <-b.jobs:
-			b.process(ctx, j)
-		}
+// worker runs jobs one at a time on a background context so an in-flight turn
+// survives SIGTERM and completes during the graceful drain in Run.
+func (b *Bot) worker() {
+	for j := range b.jobs {
+		b.process(context.Background(), j)
 	}
 }
 

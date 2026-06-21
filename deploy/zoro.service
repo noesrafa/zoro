@@ -14,6 +14,8 @@ Environment=PATH=/home/rafael/.local/bin:/home/rafael/.bun/bin:/usr/local/go/bin
 ExecStart=/home/rafael/zoro/bin/zoro
 Restart=always
 RestartSec=5
+# Give in-flight/queued Telegram turns time to finish on stop (graceful drain).
+TimeoutStopSec=120
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=zoro

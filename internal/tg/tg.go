@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -33,13 +34,29 @@ type Client struct {
 	hc      *http.Client
 }
 
-// New builds a client for the given bot token.
+// New builds a client for the given bot token. It forces IPv4 because the IPv6
+// route to api.telegram.org is unreliable from this VPS (intermittent resets/timeouts
+// that stall long-poll). IPv4 is consistently fast here.
 func New(token string) *Client {
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if network == "tcp" || network == "tcp6" {
+				network = "tcp4"
+			}
+			return dialer.DialContext(ctx, network, addr)
+		},
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
 	return &Client{
 		token:   token,
 		api:     "https://api.telegram.org/bot" + token,
 		fileAPI: "https://api.telegram.org/file/bot" + token,
-		hc:      &http.Client{Timeout: 70 * time.Second},
+		hc:      &http.Client{Timeout: 70 * time.Second, Transport: tr},
 	}
 }
 
