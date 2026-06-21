@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -21,9 +22,9 @@ type Config struct {
 	WorkDir     string
 	DangerSkip  bool
 
-	SystemPromptFile string
-	SystemPrompt     string // contents of SystemPromptFile, read at load (boot warning only)
-	MemoryFile       string // living, versioned memory injected fresh each turn
+	// Agent content lives OUTSIDE the engine, in ~/.zoro (its own git repo).
+	ZoroHome string // ~/.zoro
+	SoulFile string // ~/.zoro/soul.md — always injected, read fresh each turn
 
 	StateDir  string
 	InboxDir  string
@@ -46,25 +47,25 @@ func Load() (Config, error) {
 	loadDotEnv(".env")
 
 	c := Config{
-		Token:            getenv("TELEGRAM_BOT_TOKEN", ""),
-		ClaudeBin:        getenv("CLAUDE_BIN", "/home/rafael/.local/bin/claude"),
-		ClaudeModel:      getenv("CLAUDE_MODEL", "opus"),
-		Effort:           getenv("ZORO_EFFORT", "high"),
-		WorkDir:          getenv("ZORO_WORK_DIR", "/home/rafael"),
-		DangerSkip:       getbool("ZORO_DANGER_SKIP", true),
-		SystemPromptFile: getenv("ZORO_PROMPT_FILE", "/home/rafael/zoro/prompt/zoro.md"),
-		MemoryFile:       getenv("ZORO_MEMORY_FILE", "/home/rafael/zoro/memory/zoro.md"),
-		StateDir:         getenv("ZORO_STATE_DIR", "/home/rafael/zoro/state"),
-		InboxDir:         getenv("ZORO_INBOX_DIR", "/home/rafael/zoro/inbox"),
-		OutboxDir:        getenv("ZORO_OUTBOX_DIR", "/home/rafael/zoro/outbox"),
-		FFmpegBin:        getenv("FFMPEG_BIN", "ffmpeg"),
-		WhisperBin:       getenv("WHISPER_BIN", ""),
-		WhisperModel:     getenv("WHISPER_MODEL", ""),
-		WhisperLang:      getenv("WHISPER_LANG", "es"),
-		PiperBin:         getenv("PIPER_BIN", ""),
-		PiperVoice:       getenv("PIPER_VOICE", ""),
-		MaxFileBytes:     getint64("ZORO_MAX_FILE_BYTES", 20*1024*1024),
+		Token:        getenv("TELEGRAM_BOT_TOKEN", ""),
+		ClaudeBin:    getenv("CLAUDE_BIN", "/home/rafael/.local/bin/claude"),
+		ClaudeModel:  getenv("CLAUDE_MODEL", "opus"),
+		Effort:       getenv("ZORO_EFFORT", "high"),
+		WorkDir:      getenv("ZORO_WORK_DIR", "/home/rafael"),
+		DangerSkip:   getbool("ZORO_DANGER_SKIP", true),
+		ZoroHome:     getenv("ZORO_HOME", "/home/rafael/.zoro"),
+		StateDir:     getenv("ZORO_STATE_DIR", "/home/rafael/zoro/state"),
+		InboxDir:     getenv("ZORO_INBOX_DIR", "/home/rafael/zoro/inbox"),
+		OutboxDir:    getenv("ZORO_OUTBOX_DIR", "/home/rafael/zoro/outbox"),
+		FFmpegBin:    getenv("FFMPEG_BIN", "ffmpeg"),
+		WhisperBin:   getenv("WHISPER_BIN", ""),
+		WhisperModel: getenv("WHISPER_MODEL", ""),
+		WhisperLang:  getenv("WHISPER_LANG", "es"),
+		PiperBin:     getenv("PIPER_BIN", ""),
+		PiperVoice:   getenv("PIPER_VOICE", ""),
+		MaxFileBytes: getint64("ZORO_MAX_FILE_BYTES", 20*1024*1024),
 	}
+	c.SoulFile = getenv("ZORO_SOUL_FILE", filepath.Join(c.ZoroHome, "soul.md"))
 
 	if id := getenv("TELEGRAM_OWNER_ID", ""); id != "" {
 		v, err := strconv.ParseInt(id, 10, 64)
@@ -72,10 +73,6 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("invalid TELEGRAM_OWNER_ID %q: %w", id, err)
 		}
 		c.OwnerID = v
-	}
-
-	if b, err := os.ReadFile(c.SystemPromptFile); err == nil {
-		c.SystemPrompt = strings.TrimSpace(string(b))
 	}
 
 	if c.Token == "" {

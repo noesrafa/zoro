@@ -13,11 +13,10 @@ import (
 )
 
 type Config struct {
-	Bin          string
-	Model        string
-	WorkDir      string // cmd.Dir — MUST be constant across calls or --resume forks a new session
-	SystemPrompt string // appended via --append-system-prompt
-	DangerSkip   bool
+	Bin        string
+	Model      string
+	WorkDir    string // cmd.Dir — MUST be constant across calls or --resume forks a new session
+	DangerSkip bool
 }
 
 // Result is the outcome of one turn.
@@ -53,12 +52,8 @@ func (d *Driver) args(sessionID string, create bool, prompt string, o RunOpts) [
 	if o.Effort != "" {
 		a = append(a, "--effort", o.Effort)
 	}
-	sys := o.SystemPrompt
-	if sys == "" {
-		sys = d.cfg.SystemPrompt
-	}
-	if sys != "" {
-		a = append(a, "--append-system-prompt", sys)
+	if o.SystemPrompt != "" {
+		a = append(a, "--append-system-prompt", o.SystemPrompt)
 	}
 	if d.cfg.DangerSkip {
 		a = append(a, "--dangerously-skip-permissions")

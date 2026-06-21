@@ -28,8 +28,9 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	if cfg.SystemPrompt == "" {
-		log.Warn("system prompt is empty — file missing?", "file", cfg.SystemPromptFile)
+	if err := ensureSoul(cfg.ZoroHome, cfg.SoulFile); err != nil {
+		log.Error("soul", "err", err)
+		os.Exit(1)
 	}
 
 	store, err := session.Open(cfg.StateDir)
@@ -53,4 +54,16 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info("zoro stopped")
+}
+
+// ensureSoul makes sure ~/.zoro and soul.md exist, seeding a default soul on a
+// fresh deploy. The living soul is maintained in ~/.zoro (its own git repo).
+func ensureSoul(home, soulFile string) error {
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		return err
+	}
+	if _, err := os.Stat(soulFile); err == nil {
+		return nil
+	}
+	return os.WriteFile(soulFile, []byte(defaultSoul), 0o644)
 }

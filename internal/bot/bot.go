@@ -89,11 +89,10 @@ func New(cfg config.Config, log *slog.Logger, store *session.Store, set *setting
 		store: store,
 		set:   set,
 		cd: claude.New(claude.Config{
-			Bin:          cfg.ClaudeBin,
-			Model:        cfg.ClaudeModel,
-			WorkDir:      cfg.WorkDir,
-			SystemPrompt: cfg.SystemPrompt,
-			DangerSkip:   cfg.DangerSkip,
+			Bin:        cfg.ClaudeBin,
+			Model:      cfg.ClaudeModel,
+			WorkDir:    cfg.WorkDir,
+			DangerSkip: cfg.DangerSkip,
 		}),
 		tts: tts.Config{PiperBin: cfg.PiperBin, PiperVoice: cfg.PiperVoice, FFmpegBin: cfg.FFmpegBin},
 		mediaC: media.Config{
@@ -361,18 +360,11 @@ func (b *Bot) process(parent context.Context, j job) {
 	b.sendOutbox(parent, j.chatID, before)
 }
 
-// systemPrompt assembles the system prompt FRESH each turn: the persona plus the
-// living, versioned memory file. Editing either takes effect on the next message
-// (no restart needed).
+// systemPrompt reads the agent's soul FRESH each turn from ~/.zoro/soul.md (identity,
+// behavior, skills, memory — all in one). Editing it takes effect on the next message,
+// no restart needed.
 func (b *Bot) systemPrompt() string {
-	var parts []string
-	if s := readFile(b.cfg.SystemPromptFile); s != "" {
-		parts = append(parts, s)
-	}
-	if s := readFile(b.cfg.MemoryFile); s != "" {
-		parts = append(parts, "# Live memory (versioned in git — keep it current)\n\n"+s)
-	}
-	return strings.Join(parts, "\n\n---\n\n")
+	return readFile(b.cfg.SoulFile)
 }
 
 func readFile(path string) string {

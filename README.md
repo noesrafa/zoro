@@ -49,8 +49,12 @@ Until then, voice notes get a "not installed yet" reply and everything else work
 See `.env.example`. Defaults target this VPS (`/home/rafael`, `opus`, full autonomy).
 ```
 .env             secrets + config (chmod 600, not committed)
-prompt/zoro.md   the agent's persona (--append-system-prompt)
-state/           session id + tts scratch
+state/           session id + model/effort + tts scratch
 inbox/           downloaded Telegram attachments
 outbox/          files the agent writes here are sent to chat
 ```
+
+The agent's **soul** (identity, behavior, skills, memory) is NOT in this repo. It
+lives in `~/.zoro/soul.md` — its own git repo — and is injected fresh into every
+message (`--append-system-prompt`), so editing it hot-reloads on the next message.
+The daemon seeds a default `~/.zoro/soul.md` on first run if none exists.
