@@ -304,16 +304,23 @@ func (b *Bot) process(parent context.Context, j job) {
 	opts := claude.RunOpts{Model: cur.Model, Effort: cur.Effort, SystemPrompt: b.systemPrompt()}
 
 	st := b.store.Current()
-	res, err := b.cd.Run(ctx, st.SessionID, !st.Created, prompt, opts)
+	// On a NEW session, prime the conversation once with the heavy context.md
+	// (durable background about rafiña). On resumes it's already in history.
+	turnPrompt := prompt
+	if !st.Created {
+		turnPrompt = b.primeWithContext(prompt)
+	}
+	res, err := b.cd.Run(ctx, st.SessionID, !st.Created, turnPrompt, opts)
 	if err != nil && ctx.Err() != nil {
 		return // cancelled / shutting down
 	}
 	if err != nil && st.Created {
-		// Resume failed (e.g. transcript gone) — rotate to a fresh session and retry once.
+		// Resume failed (e.g. transcript gone) — rotate to a fresh session and retry once,
+		// re-priming the new session with context.
 		b.log.Warn("resume failed, rotating session", "err", err)
 		if ns, nerr := b.store.New(); nerr == nil {
 			st = ns
-			res, err = b.cd.Run(ctx, st.SessionID, true, prompt, opts)
+			res, err = b.cd.Run(ctx, st.SessionID, true, b.primeWithContext(prompt), opts)
 		}
 	}
 	if err != nil {
@@ -367,11 +374,22 @@ func (b *Bot) process(parent context.Context, j job) {
 	b.sendOutbox(parent, j.chatID, before)
 }
 
-// systemPrompt reads the agent's soul FRESH each turn from ~/.zoro/soul.md (identity,
-// behavior, skills, memory — all in one). Editing it takes effect on the next message,
-// no restart needed.
+// systemPrompt reads the agent's soul FRESH each turn from ~/.zoro/soul.md (identity +
+// behavior). Editing it takes effect on the next message, no restart needed.
 func (b *Bot) systemPrompt() string {
 	return readFile(b.cfg.SoulFile)
+}
+
+// primeWithContext prepends the durable background (~/.zoro/context.md) to the first
+// message of a new session, so it enters the conversation history once. Returns the
+// prompt unchanged if there is no context file.
+func (b *Bot) primeWithContext(userPrompt string) string {
+	c := readFile(b.cfg.ContextFile)
+	if c == "" {
+		return userPrompt
+	}
+	return "[SESSION CONTEXT — durable background about rafiña, loaded once at the start of this conversation. Your identity and behavior rules are in your system prompt.]\n\n" +
+		c + "\n\n---\n\nrafiña: " + userPrompt
 }
 
 func readFile(path string) string {

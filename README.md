@@ -54,7 +54,11 @@ inbox/           downloaded Telegram attachments
 outbox/          files the agent writes here are sent to chat
 ```
 
-The agent's **soul** (identity, behavior, skills, memory) is NOT in this repo. It
-lives in `~/.zoro/soul.md` — its own git repo — and is injected fresh into every
-message (`--append-system-prompt`), so editing it hot-reloads on the next message.
-The daemon seeds a default `~/.zoro/soul.md` on first run if none exists.
+The agent's brain is NOT in this repo — it lives in `~/.zoro` (its own git repo), split in two:
+- `~/.zoro/soul.md` — WHO zoro is + HOW it behaves. Injected into **every message**
+  (`--append-system-prompt`); editing hot-reloads on the next message.
+- `~/.zoro/context.md` — durable background about the user. Injected **once at the start
+  of each conversation** (prepended to the first message, then carried in history via
+  `--resume`); editing applies to the next new conversation (`/newsession`).
+
+The daemon seeds defaults for both on first run if missing.

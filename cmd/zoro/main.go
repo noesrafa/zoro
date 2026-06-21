@@ -28,8 +28,12 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	if err := ensureSoul(cfg.ZoroHome, cfg.SoulFile); err != nil {
+	if err := ensureSeed(cfg.ZoroHome, cfg.SoulFile, defaultSoul); err != nil {
 		log.Error("soul", "err", err)
+		os.Exit(1)
+	}
+	if err := ensureSeed(cfg.ZoroHome, cfg.ContextFile, defaultContext); err != nil {
+		log.Error("context", "err", err)
 		os.Exit(1)
 	}
 
@@ -56,14 +60,14 @@ func main() {
 	log.Info("zoro stopped")
 }
 
-// ensureSoul makes sure ~/.zoro and soul.md exist, seeding a default soul on a
-// fresh deploy. The living soul is maintained in ~/.zoro (its own git repo).
-func ensureSoul(home, soulFile string) error {
+// ensureSeed makes sure ~/.zoro and the given file exist, seeding default content
+// on a fresh deploy. The living soul/context are maintained in ~/.zoro (its own repo).
+func ensureSeed(home, path, content string) error {
 	if err := os.MkdirAll(home, 0o755); err != nil {
 		return err
 	}
-	if _, err := os.Stat(soulFile); err == nil {
+	if _, err := os.Stat(path); err == nil {
 		return nil
 	}
-	return os.WriteFile(soulFile, []byte(defaultSoul), 0o644)
+	return os.WriteFile(path, []byte(content), 0o644)
 }

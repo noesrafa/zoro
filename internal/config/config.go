@@ -23,8 +23,9 @@ type Config struct {
 	DangerSkip  bool
 
 	// Agent content lives OUTSIDE the engine, in ~/.zoro (its own git repo).
-	ZoroHome string // ~/.zoro
-	SoulFile string // ~/.zoro/soul.md — always injected, read fresh each turn
+	ZoroHome    string // ~/.zoro
+	SoulFile    string // ~/.zoro/soul.md — always injected (every turn), read fresh
+	ContextFile string // ~/.zoro/context.md — injected once at the start of each session
 
 	StateDir  string
 	InboxDir  string
@@ -66,6 +67,7 @@ func Load() (Config, error) {
 		MaxFileBytes: getint64("ZORO_MAX_FILE_BYTES", 20*1024*1024),
 	}
 	c.SoulFile = getenv("ZORO_SOUL_FILE", filepath.Join(c.ZoroHome, "soul.md"))
+	c.ContextFile = getenv("ZORO_CONTEXT_FILE", filepath.Join(c.ZoroHome, "context.md"))
 
 	if id := getenv("TELEGRAM_OWNER_ID", ""); id != "" {
 		v, err := strconv.ParseInt(id, 10, 64)
