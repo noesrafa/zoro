@@ -143,28 +143,54 @@ type apiResp struct {
 }
 
 func (c *Client) call(ctx context.Context, method string, params url.Values, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.api+"/"+method, strings.NewReader(params.Encode()))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := c.hc.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
+	// Retry transient transport errors (network blips, resets, timeouts) so a reply
+	// is never silently dropped. API rejections (r.OK == false) are deterministic and
+	// returned immediately — no point retrying those. Honors ctx cancellation.
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return lastErr
+			case <-time.After(time.Duration(attempt) * 1500 * time.Millisecond):
+			}
+		}
 
-	var r apiResp
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
-		return err
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.api+"/"+method, strings.NewReader(params.Encode()))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+		resp, err := c.hc.Do(req)
+		if err != nil {
+			lastErr = err
+			if ctx.Err() != nil {
+				return err // caller cancelled / deadline — stop retrying
+			}
+			continue // transient transport error — back off and retry
+		}
+
+		var r apiResp
+		derr := json.NewDecoder(resp.Body).Decode(&r)
+		resp.Body.Close()
+		if derr != nil {
+			lastErr = derr
+			if ctx.Err() != nil {
+				return derr
+			}
+			continue // truncated/garbled response — retry
+		}
+		if !r.OK {
+			return fmt.Errorf("telegram %s: %s (code %d)", method, r.Description, r.ErrorCode)
+		}
+		if out != nil && len(r.Result) > 0 {
+			return json.Unmarshal(r.Result, out)
+		}
+		return nil
 	}
-	if !r.OK {
-		return fmt.Errorf("telegram %s: %s (code %d)", method, r.Description, r.ErrorCode)
-	}
-	if out != nil && len(r.Result) > 0 {
-		return json.Unmarshal(r.Result, out)
-	}
-	return nil
+	return lastErr
 }
 
 // GetUpdates long-polls for new updates starting at offset.

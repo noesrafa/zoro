@@ -51,10 +51,11 @@ Commands:
 /model <opus|sonnet|haiku|fable|claude-…> — switch model (persists)
 /effort <low|medium|high|xhigh|max> — set reasoning effort (persists)
 /voice <msg> — reply with a voice note
-/btw <question> — quick side-question (parallel Sonnet, won't touch this chat)
+/btw <question> — side-question in parallel on Opus (researches freely, won't touch this chat)
 /crons — list scheduled messages (and next run)
 /crons <id> — fire that scheduled message now
 /status — session, model, effort, uptime
+/uso — uso de Claude Code (límites 5h / 7d, snapshot oficial vía claude-hud)
 /ls [path] — list VM files
 /stats — VM + git repo status
 /cancel — stop the current task
@@ -223,6 +224,8 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 			b.send(ctx, m.Chat.ID, helpText)
 		case "/status":
 			b.send(ctx, m.Chat.ID, b.statusText())
+		case "/uso", "/usage":
+			b.send(ctx, m.Chat.ID, usoText())
 		case "/ls":
 			b.send(ctx, m.Chat.ID, b.listDir(firstArg(text, fields[0])))
 		case "/stats":
@@ -662,6 +665,7 @@ func (b *Bot) registerCommands(ctx context.Context) {
 		{Command: "btw", Description: "Quick side-question in parallel: /btw <question>"},
 		{Command: "crons", Description: "List scheduled messages and next run"},
 		{Command: "status", Description: "Show session, model, effort, uptime"},
+		{Command: "uso", Description: "Claude Code usage (5h / 7d rate limits)"},
 		{Command: "ls", Description: "List VM files: /ls [path]"},
 		{Command: "stats", Description: "VM + git repo status"},
 		{Command: "cancel", Description: "Cancel the current task"},
@@ -740,17 +744,19 @@ func (b *Bot) notify(text string) {
 	}
 }
 
-// handleBtw answers a quick side-question in PARALLEL with the main worker: a
-// throwaway Sonnet session (not stored, not primed with context.md) so it stays
-// fast and never pollutes or blocks the main conversation. Runs in its own
-// goroutine straight from dispatch — outside the serialized job queue.
+// handleBtw answers a side-question in PARALLEL with the main worker: a throwaway
+// Opus session (not stored, not primed with context.md) so it never pollutes or
+// blocks the main conversation. It may research freely (launch tasks/workflows),
+// so there is NO deadline — it runs on context.Background() like the main worker
+// and always delivers, however long it takes. Runs in its own goroutine straight
+// from dispatch — outside the serialized job queue.
 func (b *Bot) handleBtw(chatID int64, question string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stop := b.typingPump(ctx, chatID, tg.ActionTyping)
 	defer stop()
 
-	opts := claude.RunOpts{Model: "sonnet", Effort: "medium", SystemPrompt: b.systemPrompt()}
+	opts := claude.RunOpts{Model: "opus", Effort: "medium", SystemPrompt: b.systemPrompt()}
 	res, err := b.cd.Run(ctx, uid.New(), true, question, opts)
 	stop()
 	if err != nil {
