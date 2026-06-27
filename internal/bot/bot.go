@@ -216,6 +216,11 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 	}
 
 	text := strings.TrimSpace(m.Text)
+	// Telegram puts the text of a message WITH an attachment in Caption, not Text.
+	// Promote a slash-command caption so commands (/btw, /voice, …) work with media too.
+	if text == "" && strings.HasPrefix(strings.TrimSpace(m.Caption), "/") {
+		text = strings.TrimSpace(m.Caption)
+	}
 	if strings.HasPrefix(text, "/") {
 		fields := strings.Fields(text)
 		cmd := strings.SplitN(fields[0], "@", 2)[0] // strip @botname
