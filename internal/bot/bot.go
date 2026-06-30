@@ -9,11 +9,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -60,6 +62,7 @@ Commands:
 /stats — VM + git repo status
 /cancel — stop the current task
 /redeploy — rebuild my code + restart (apply changes)
+/update — pull latest code from GitHub + rebuild + restart
 /restart — restart me
 /help — this
 
@@ -268,6 +271,8 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 			}()
 		case "/redeploy":
 			go b.redeploy(m.Chat.ID)
+		case "/update":
+			go b.update(m.Chat.ID)
 		case "/compact":
 			b.enqueue(job{chatID: m.Chat.ID, prompt: "/compact", isCompact: true})
 		case "/model":
@@ -675,6 +680,7 @@ func (b *Bot) registerCommands(ctx context.Context) {
 		{Command: "stats", Description: "VM + git repo status"},
 		{Command: "cancel", Description: "Cancel the current task"},
 		{Command: "redeploy", Description: "Rebuild engine + restart (apply code changes)"},
+		{Command: "update", Description: "Pull latest code from GitHub + rebuild + restart"},
 		{Command: "restart", Description: "Restart the daemon"},
 		{Command: "help", Description: "Show help"},
 	}
@@ -899,22 +905,71 @@ func oneLine(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-// redeploy rebuilds the engine and, on success, restarts the daemon (detached so the
-// reply lands first). On build failure it reports the error and does NOT restart.
-func (b *Bot) redeploy(chatID int64) {
+// goBin resolves the Go toolchain across platforms: $GO override, then PATH, then
+// common install locations (Homebrew on macOS, /usr/local/go on Linux).
+func goBin() string {
+	if g := os.Getenv("GO"); g != "" {
+		return g
+	}
+	if p, err := exec.LookPath("go"); err == nil {
+		return p
+	}
+	for _, p := range []string{"/opt/homebrew/bin/go", "/usr/local/go/bin/go"} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "/usr/local/go/bin/go"
+}
+
+// restartDetached relaunches the daemon out-of-band so the in-flight reply lands
+// first and this process can exit. Linux uses systemd (sudo); macOS uses the
+// per-user launchd agent (no sudo). The child is detached so it outlives us.
+func (b *Bot) restartDetached() {
+	if runtime.GOOS == "darwin" {
+		c := exec.Command("bash", "-c", "sleep 1; launchctl kickstart -k gui/$(id -u)/com.zoro.agent >/dev/null 2>&1")
+		c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		_ = c.Start()
+		return
+	}
+	// Linux: systemd brings up the new binary; lifecycle messages (💤 → ⚡) confirm it.
+	_ = exec.Command("setsid", "bash", "-c", "sleep 1; sudo systemctl restart zoro >/dev/null 2>&1").Start()
+}
+
+// buildAndRestart rebuilds the engine and, on success, restarts the daemon. On
+// build failure it reports the error and does NOT restart.
+func (b *Bot) buildAndRestart(chatID int64) {
 	b.send(context.Background(), chatID, "🔧 Rebuilding zoro…")
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "/usr/local/go/bin/go", "build", "-o", "bin/zoro", "./cmd/zoro")
+	cmd := exec.CommandContext(ctx, goBin(), "build", "-o", "bin/zoro", "./cmd/zoro")
 	cmd.Dir = b.cfg.EngineDir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		b.send(context.Background(), chatID, "❌ Build falló — NO reinicio:\n"+truncate(strings.TrimSpace(string(out)), 1500))
 		return
 	}
 	b.send(context.Background(), chatID, "✅ Build OK — aplicando (reinicio)…")
-	// Detached restart: survives this process exiting; systemd brings up the new binary,
-	// and the lifecycle messages (💤 → ⚡) confirm it.
-	_ = exec.Command("setsid", "bash", "-c", "sleep 1; sudo systemctl restart zoro >/dev/null 2>&1").Start()
+	b.restartDetached()
+}
+
+// redeploy rebuilds the current working tree and restarts (apply local changes).
+func (b *Bot) redeploy(chatID int64) { b.buildAndRestart(chatID) }
+
+// update fast-forwards the engine repo from GitHub, then rebuilds and restarts.
+// Use it to roll out code pushed from elsewhere (e.g. another zoro instance).
+func (b *Bot) update(chatID int64) {
+	b.send(context.Background(), chatID, "⬇️ Pulling latest from GitHub…")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	pull := exec.CommandContext(ctx, "git", "-C", b.cfg.EngineDir, "pull", "--ff-only")
+	out, err := pull.CombinedOutput()
+	res := strings.TrimSpace(string(out))
+	if err != nil {
+		b.send(context.Background(), chatID, "❌ git pull falló — NO rebuildeo:\n"+truncate(res, 1200))
+		return
+	}
+	b.send(context.Background(), chatID, "📥 "+truncate(res, 800))
+	b.buildAndRestart(chatID)
 }
 
 // listDir returns a clean, scannable listing: dirs first (📁), then files (📄), names only.
@@ -984,15 +1039,15 @@ echo
 echo "🔧 services"
 for s in zoro daph; do printf "  %-7s %s\n" "$s" "$(systemctl is-active $s 2>/dev/null)"; done
 echo
-echo "📦 git repos under /home/rafael (dirty / unpushed)"
+echo "📦 git repos under $HOME (dirty / unpushed)"
 found=0
-for d in $(find /home/rafael -maxdepth 3 -type d -name .git -not -path '*/node_modules/*' 2>/dev/null); do
+for d in $(find "$HOME" -maxdepth 3 -type d -name .git -not -path '*/node_modules/*' 2>/dev/null); do
   r=$(dirname "$d")
   dirty=$(git -C "$r" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
   branch=$(git -C "$r" rev-parse --abbrev-ref HEAD 2>/dev/null)
   ahead=$(git -C "$r" rev-list --count '@{u}..HEAD' 2>/dev/null || echo '-')
   if [ "$dirty" != "0" ] || { [ "$ahead" != "0" ] && [ "$ahead" != "-" ]; }; then
-    printf "  • %-22s [%s] uncommitted:%s unpushed:%s\n" "${r#/home/rafael/}" "$branch" "$dirty" "$ahead"
+    printf "  • %-22s [%s] uncommitted:%s unpushed:%s\n" "${r#$HOME/}" "$branch" "$dirty" "$ahead"
     found=1
   fi
 done

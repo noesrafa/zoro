@@ -1,8 +1,9 @@
 # zoro ⚔️
 
 A single-user Telegram agent backed by the Claude Code CLI. One persistent
-conversation, running inside `/home/rafael`, supervised by systemd so it never
-dies and revives on reboot. Pure Go, zero external dependencies.
+conversation, running inside your home dir (`ZORO_WORK_DIR`), supervised by
+systemd (Linux) or launchd (macOS) so it never dies and revives on reboot. Pure
+Go, zero external dependencies. Runs on a VPS or a Mac — see **Install** below.
 
 ## How it works
 
@@ -24,16 +25,51 @@ Telegram (long poll) ──▶ bot ──▶ claude -p --resume <uuid> --output-
 
 ## Commands
 
-`/newsession` `/compact` `/voice <msg>` `/status` `/cancel` `/restart` `/help`
+`/newsession` `/compact` `/voice <msg>` `/status` `/cancel` `/redeploy`
+`/update` `/restart` `/help`
 
-## Build & run
+- **`/redeploy`** — rebuild the current working tree + restart (apply local edits).
+- **`/update`** — `git pull --ff-only` from GitHub, then rebuild + restart. Use it
+  to roll out code pushed from elsewhere (e.g. your VPS instance → your Mac instance),
+  straight from Telegram.
+
+## Install
+
+One script, OS-aware. It checks deps, builds, and installs the service:
+
+```bash
+bash deploy/install.sh
+#   Linux → systemd unit  (deploy/zoro.service),        needs sudo
+#   macOS → launchd agent (deploy/com.zoro.agent.plist), no sudo
+```
+
+First run with no `.env` copies `.env.example` and stops so you can fill in
+`TELEGRAM_BOT_TOKEN` + `TELEGRAM_OWNER_ID`; re-run to finish. Requires `go`, `git`,
+the `claude` CLI (run `claude /login` once); `ffmpeg` is optional (voice).
+
+Dev loop:
 
 ```bash
 make build      # → bin/zoro
 make run        # local (reads ./.env)
-make install    # build + install/enable/restart systemd unit (needs sudo)
-make logs       # journalctl -u zoro -f
+make install    # → bash deploy/install.sh
+make logs       # journalctl -u zoro -f   (Linux)
 ```
+
+### Run a second instance (e.g. on a Mac)
+
+The engine is path-portable (all paths default from `ZORO_*` env / `$HOME`), so you
+can run another copy elsewhere — a Mac agent that drives Claude Code locally with
+your files in reach. Transport is Telegram itself, so **no Tailscale/VPN needed**;
+the host just needs outbound internet.
+
+1. Create a **second Telegram bot** with @BotFather (one bot token = one poller — you
+   can't share the VPS bot).
+2. `git clone` this repo on the Mac, set the new token + your owner id in `.env`
+   (point `ZORO_*` paths at the Mac's home).
+3. `bash deploy/install.sh` → installs the launchd agent. Keep the Mac awake
+   (`caffeinate -s`, or a Mac mini that never sleeps).
+4. Push code from anywhere → run **`/update`** in the Mac chat to pull + rebuild.
 
 ## Voice (optional, off until installed)
 
