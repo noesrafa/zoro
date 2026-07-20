@@ -450,12 +450,25 @@ func (b *Bot) process(parent context.Context, j job) {
 	if err != nil && ctx.Err() != nil {
 		return // cancelled / shutting down
 	}
+	// Create collided with an existing session id — this happens when state got
+	// stuck at created:false while pointing at a live transcript. The session
+	// really exists, so resume it instead of bricking the turn with the raw
+	// "Session ID … is already in use" error.
+	if err != nil && !st.Created && strings.Contains(strings.ToLower(err.Error()), "already in use") {
+		b.log.Warn("session id already exists on create, resuming instead", "id", st.SessionID)
+		_ = b.store.MarkCreated()
+		st = b.store.Current()
+		res, err = b.cd.Run(ctx, st.SessionID, false, prompt, opts)
+	}
 	if err != nil && st.Created {
-		// Resume failed (e.g. transcript gone) — rotate to a fresh session and retry once,
-		// re-priming the new session with context.
-		b.log.Warn("resume failed, rotating session", "err", err)
+		// Resume failed. Per rafiña: no silent retry — surface the real error and
+		// tell him the thread was reset, then answer on a fresh session so he
+		// always knows WHY the context is gone.
+		resumeErr := err
+		b.log.Warn("resume failed, starting new session", "err", err)
 		if ns, nerr := b.store.New(); nerr == nil {
 			st = ns
+			b.send(parent, j.chatID, "⚠️ Couldn't resume the previous conversation (resume failed) — started a NEW one, so the prior thread is gone. Error:\n"+truncate(resumeErr.Error(), 800))
 			res, err = b.cd.Run(ctx, st.SessionID, true, b.primeWithContext(prompt), opts)
 		}
 	}
@@ -467,7 +480,9 @@ func (b *Bot) process(parent context.Context, j job) {
 		return
 	}
 
-	// Persist session continuity.
+	// Persist session continuity: always adopt the id the CLI actually used and
+	// mark it created, so the next turn resumes instead of re-creating (which is
+	// what left state stuck at created:false and caused "already in use").
 	if res.SessionID != "" && res.SessionID != st.SessionID {
 		_ = b.store.Set(res.SessionID, true)
 	} else if !st.Created {
