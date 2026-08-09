@@ -13,8 +13,9 @@ import (
 )
 
 type Config struct {
-	Token   string
-	OwnerID int64
+	Token    string
+	OwnerID  int64          // primario (recibe crons/notify): el primero de la lista
+	OwnerIDs map[int64]bool // todos los IDs autorizados a hablarle al bot
 
 	ClaudeBin   string
 	ClaudeModel string
@@ -73,12 +74,24 @@ func Load() (Config, error) {
 	c.ContextFile = getenv("ZORO_CONTEXT_FILE", filepath.Join(c.ZoroHome, "context.md"))
 	c.CronFile = getenv("ZORO_CRON_FILE", filepath.Join(c.ZoroHome, "crons.json"))
 
-	if id := getenv("TELEGRAM_OWNER_ID", ""); id != "" {
-		v, err := strconv.ParseInt(id, 10, 64)
-		if err != nil {
-			return c, fmt.Errorf("invalid TELEGRAM_OWNER_ID %q: %w", id, err)
+	// TELEGRAM_OWNER_ID admite varios IDs separados por coma. El primero es el
+	// "primario" (recibe crons/notify); TODOS pueden hablarle al bot.
+	c.OwnerIDs = map[int64]bool{}
+	if ids := getenv("TELEGRAM_OWNER_ID", ""); ids != "" {
+		for _, part := range strings.Split(ids, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			v, err := strconv.ParseInt(part, 10, 64)
+			if err != nil {
+				return c, fmt.Errorf("invalid TELEGRAM_OWNER_ID %q: %w", part, err)
+			}
+			if c.OwnerID == 0 {
+				c.OwnerID = v
+			}
+			c.OwnerIDs[v] = true
 		}
-		c.OwnerID = v
 	}
 
 	if c.Token == "" {

@@ -213,7 +213,7 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 	if m == nil || m.From == nil {
 		return
 	}
-	if m.From.ID != b.cfg.OwnerID {
+	if !b.cfg.OwnerIDs[m.From.ID] {
 		b.log.Warn("ignored non-owner", "from", m.From.ID, "username", m.From.Username)
 		return
 	}
