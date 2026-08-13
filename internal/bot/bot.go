@@ -460,6 +460,23 @@ func (b *Bot) process(parent context.Context, j job) {
 		st = b.store.Current()
 		res, err = b.cd.Run(ctx, st.SessionID, false, prompt, opts)
 	}
+	// Login died. The CLI itself ran fine — it just couldn't authenticate — so the
+	// session is INTACT and must not be burned. Falling through to the resume-failed
+	// branch below was silently throwing away the whole conversation on every token
+	// hiccup, and reporting a bare "exit status 1" because auth failures print
+	// NOTHING to stderr. Report the real reason and stop.
+	if err != nil && res.Failure() == claude.FailAuth {
+		// The CLI writes the transcript before failing, so the session id now exists:
+		// adopt it as created, or the next turn re-creates it and hits "already in use".
+		if res.SessionID != "" {
+			_ = b.store.Set(res.SessionID, true)
+		}
+		b.log.Error("claude auth failure", "detail", res.Diagnostic())
+		msg := b.failureText(res, err)
+		b.send(parent, j.chatID, msg)
+		b.mirror(parent, j, prompt, msg)
+		return
+	}
 	if err != nil && st.Created {
 		// Resume failed. Per rafiña: no silent retry — surface the real error and
 		// tell him the thread was reset, then answer on a fresh session so he
@@ -476,7 +493,9 @@ func (b *Bot) process(parent context.Context, j job) {
 		if ctx.Err() != nil {
 			return
 		}
-		b.send(parent, j.chatID, "⚠️ "+truncate(err.Error(), 1500))
+		msg := b.failureText(res, err)
+		b.send(parent, j.chatID, msg)
+		b.mirror(parent, j, prompt, msg)
 		return
 	}
 
@@ -503,6 +522,10 @@ func (b *Bot) process(parent context.Context, j job) {
 		}
 	}
 
+	// Echo the turn to the watcher before delivering it, so the mirror is complete
+	// even on the voice path below (which returns early).
+	b.mirror(parent, j, prompt, reply)
+
 	// Voice reply (mirror modality): synthesize into a temp dir (not the outbox).
 	if wantVoice && b.tts.Available() && reply != "" {
 		if ogg, terr := tts.Synthesize(ctx, b.tts, reply, b.ttsDir); terr == nil {
@@ -523,6 +546,62 @@ func (b *Bot) process(parent context.Context, j job) {
 		b.reply(parent, j.chatID, reply)
 	}
 	b.sendOutbox(parent, j.chatID, before)
+}
+
+// failureText turns a failed turn into something a human can act on. The CLI's own
+// words (stdout) beat the process error, because the failures that matter most —
+// the OAuth session dying above all — exit 1 with a COMPLETELY EMPTY stderr, which
+// is why this used to surface as a bare "claude exited: exit status 1:".
+func (b *Bot) failureText(res claude.Result, err error) string {
+	switch res.Failure() {
+	case claude.FailAuth:
+		return "🔒 I died on login — my Claude session expired and couldn't be refreshed.\n\n" +
+			"Nothing is lost: the conversation is intact and I'll pick it up as soon as you log in again " +
+			"(on the VPS: run `claude` → `/login`).\n\n" +
+			"CLI said: " + truncate(res.Diagnostic(), 400)
+	case claude.FailLimit:
+		return "🚦 I hit the usage limit — can't answer this turn.\n\nCLI said: " + truncate(res.Diagnostic(), 400)
+	}
+	if d := strings.TrimSpace(res.Diagnostic()); d != "" {
+		return "⚠️ " + truncate(d, 1500)
+	}
+	return "⚠️ " + truncate(err.Error(), 1500)
+}
+
+// mirror echoes a finished turn to ZORO_MIRROR_CHAT_ID through this same bot, so
+// rafiña can watch a sub-agent (sky, experienciaXXI) work with his mom/dad: who
+// wrote, what they said, and what the agent answered. Off when unset.
+func (b *Bot) mirror(ctx context.Context, j job, userText, reply string) {
+	id := b.cfg.MirrorChatID
+	if id == 0 || id == j.chatID {
+		return // mirroring off, or the watcher is the one talking
+	}
+	var sb strings.Builder
+	sb.WriteString("🪞 " + b.cfg.AgentName + " · " + senderName(j) + "\n\n")
+	sb.WriteString("👤 " + truncate(strings.TrimSpace(userText), 1500))
+	if r := strings.TrimSpace(reply); r != "" {
+		sb.WriteString("\n\n🤖 " + truncate(r, 2500))
+	} else {
+		sb.WriteString("\n\n🤖 (no reply)")
+	}
+	b.send(ctx, id, sb.String())
+}
+
+// senderName labels a mirrored turn with whoever caused it. Jobs with no source
+// message are scheduled ones.
+func senderName(j job) string {
+	for _, m := range j.msgs {
+		if m.From == nil {
+			continue
+		}
+		if n := strings.TrimSpace(m.From.FirstName); n != "" {
+			return n
+		}
+		if n := strings.TrimSpace(m.From.Username); n != "" {
+			return n
+		}
+	}
+	return "⏰ cron"
 }
 
 // systemPrompt reads the agent's soul FRESH each turn from ~/.zoro/soul.md (identity +

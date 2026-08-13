@@ -27,6 +27,54 @@ type Result struct {
 	NumTurns  int
 	IsError   bool
 	Subtype   string
+	Errors    []string // "errors" array of the result event (e.g. resume of a missing session)
+}
+
+// FailureKind classifies WHY a turn failed, read from the CLI's own output.
+// Needed because the most important failure — the OAuth session dying — exits 1
+// with a COMPLETELY EMPTY stderr, so the caller would otherwise only ever see a
+// bare "exit status 1". The real message arrives on stdout, as a <synthetic>
+// assistant text ("Failed to authenticate: OAuth session expired and could not
+// be refreshed"), which Run already accumulates into Result.Text.
+type FailureKind int
+
+const (
+	FailUnknown FailureKind = iota
+	FailAuth                // login died: expired/unrefreshable OAuth, invalid key
+	FailLimit               // subscription usage limit hit
+	FailNoSession           // --resume pointed at a transcript that doesn't exist
+)
+
+// Diagnostic is everything the CLI told us about the turn, in one string.
+func (r Result) Diagnostic() string {
+	parts := make([]string, 0, 1+len(r.Errors))
+	if t := strings.TrimSpace(r.Text); t != "" {
+		parts = append(parts, t)
+	}
+	parts = append(parts, r.Errors...)
+	return strings.Join(parts, "\n")
+}
+
+// Failure classifies a failed turn. Only meaningful when Run returned an error
+// (or Result.IsError is set).
+func (r Result) Failure() FailureKind {
+	d := strings.ToLower(r.Diagnostic())
+	switch {
+	case strings.Contains(d, "failed to authenticate"),
+		strings.Contains(d, "oauth session expired"),
+		strings.Contains(d, "could not be refreshed"),
+		strings.Contains(d, "invalid api key"),
+		strings.Contains(d, "please run /login"),
+		strings.Contains(d, "authentication_error"):
+		return FailAuth
+	case strings.Contains(d, "usage limit"),
+		strings.Contains(d, "rate limit"),
+		strings.Contains(d, "quota"):
+		return FailLimit
+	case strings.Contains(d, "no conversation found with session id"):
+		return FailNoSession
+	}
+	return FailUnknown
 }
 
 // RunOpts overrides per-turn knobs (model, effort, system prompt).
@@ -75,6 +123,7 @@ type event struct {
 	TotalCostUSD float64         `json:"total_cost_usd"`
 	NumTurns     int             `json:"num_turns"`
 	IsError      bool            `json:"is_error"`
+	Errors       []string        `json:"errors"`
 	Message      json.RawMessage `json:"message"`
 }
 
@@ -128,6 +177,7 @@ func (d *Driver) Run(ctx context.Context, sessionID string, create bool, prompt 
 			res.IsError = ev.IsError
 			res.CostUSD = ev.TotalCostUSD
 			res.NumTurns = ev.NumTurns
+			res.Errors = ev.Errors
 			if ev.SessionID != "" {
 				res.SessionID = ev.SessionID
 			}

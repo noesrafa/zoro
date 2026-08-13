@@ -34,6 +34,12 @@ type Config struct {
 	InboxDir  string
 	OutboxDir string
 
+	// Mirror: when set, every turn (who wrote + what the agent answered) is echoed
+	// to this chat via this same bot. Used so rafiña can watch the sub-agents
+	// (sky, experienciaXXI) talk to his mom/dad without being in their chats.
+	MirrorChatID int64
+	AgentName    string // label shown in mirrored messages, e.g. "sky"
+
 	FFmpegBin string
 
 	WhisperBin   string
@@ -69,6 +75,8 @@ func Load() (Config, error) {
 		PiperBin:     getenv("PIPER_BIN", ""),
 		PiperVoice:   getenv("PIPER_VOICE", ""),
 		MaxFileBytes: getint64("ZORO_MAX_FILE_BYTES", 20*1024*1024),
+		MirrorChatID: getint64("ZORO_MIRROR_CHAT_ID", 0),
+		AgentName:    getenv("ZORO_AGENT_NAME", "zoro"),
 	}
 	c.SoulFile = getenv("ZORO_SOUL_FILE", filepath.Join(c.ZoroHome, "soul.md"))
 	c.ContextFile = getenv("ZORO_CONTEXT_FILE", filepath.Join(c.ZoroHome, "context.md"))
