@@ -1,6 +1,7 @@
 package cron
 
 import (
+	"os"
 	"testing"
 	"time"
 )
@@ -86,5 +87,33 @@ func TestLoad_MissingFileIsEmpty(t *testing.T) {
 	}
 	if len(f.Crons) != 0 || f.Timezone != DefaultTimezone {
 		t.Fatalf("expected empty file with default tz, got %+v", f)
+	}
+}
+
+// A rollover job MUST be recognised as such: an old binary (or a parsing slip)
+// treats it as an ordinary cron and texts the internal close-of-day prompt's
+// output to the owner at 1am instead of rotating the session.
+func TestLoadParsesRolloverFlag(t *testing.T) {
+	dir := t.TempDir()
+	p := dir + "/crons.json"
+	body := `{"timezone":"America/Mexico_City","crons":[
+	  {"id":"gastos-hoy","schedule":"0 9 * * *","enabled":true,"prompt":"x"},
+	  {"id":"cierre-del-dia","schedule":"0 1 * * *","enabled":true,"rollover":true,"prompt":"y"}
+	]}`
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Crons) != 2 {
+		t.Fatalf("want 2 crons, got %d", len(f.Crons))
+	}
+	if f.Crons[0].Rollover {
+		t.Error("an ordinary cron must not be flagged as rollover")
+	}
+	if !f.Crons[1].Rollover {
+		t.Error("cierre-del-dia should be flagged as rollover")
 	}
 }

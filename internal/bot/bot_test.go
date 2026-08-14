@@ -1,8 +1,11 @@
 package bot
 
 import (
+	"os"
+	"strings"
 	"testing"
 
+	"zoro/internal/config"
 	"zoro/internal/tg"
 )
 
@@ -74,5 +77,45 @@ func TestDrainJobs(t *testing.T) {
 	}
 	if n := b.drainJobs(); n != 0 {
 		t.Fatalf("drainJobs() on empty = %d, want 0", n)
+	}
+}
+
+// The nightly rollover cuts the transcript, so the brief is the ONLY thing that
+// carries the thread into the next day. If it silently failed to reach the new
+// session, every morning would start amnesiac — hence these two cases.
+func TestPrimeWithContextIncludesBrief(t *testing.T) {
+	dir := t.TempDir()
+	ctxFile := dir + "/context.md"
+	briefFile := dir + "/brief.md"
+	if err := os.WriteFile(ctxFile, []byte("fondo durable"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	b := &Bot{cfg: config.Config{ContextFile: ctxFile, BriefFile: briefFile, OwnerName: "Marilú"}}
+
+	// No brief yet (first ever run): prime is context + owner-labelled message.
+	got := b.primeWithContext("hola")
+	if strings.Contains(got, "BRIEF") {
+		t.Errorf("no brief file should mean no BRIEF block, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Marilú: hola") {
+		t.Errorf("prime should label the message with the owner name, got:\n%s", got)
+	}
+	if strings.Contains(got, "rafiña") {
+		t.Errorf("owner name must not leak the default nickname, got:\n%s", got)
+	}
+
+	// After a rollover: the brief rides along, before the user's message.
+	if err := os.WriteFile(briefFile, []byte("ayer quedamos en subir precios"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got = b.primeWithContext("hola")
+	for _, want := range []string{"fondo durable", "BRIEF", "ayer quedamos en subir precios", "Marilú: hola"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("prime missing %q, got:\n%s", want, got)
+		}
+	}
+	if strings.Index(got, "ayer quedamos") > strings.Index(got, "Marilú: hola") {
+		t.Error("brief must come before the user message, not after it")
 	}
 }

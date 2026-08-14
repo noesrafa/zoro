@@ -30,6 +30,12 @@ type Job struct {
 	Schedule string `json:"schedule"`
 	Prompt   string `json:"prompt"`
 	Enabled  bool   `json:"enabled"`
+
+	// Rollover marks the nightly close-the-day job: the bot runs Prompt as a normal
+	// turn (the agent files away what matters and writes a brief), then saves that
+	// brief and rotates to a FRESH session, so the next day starts with clean
+	// context instead of an ever-growing transcript.
+	Rollover bool `json:"rollover"`
 }
 
 // File is the on-disk shape of crons.json.

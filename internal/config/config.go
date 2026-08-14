@@ -40,6 +40,15 @@ type Config struct {
 	MirrorChatID int64
 	AgentName    string // label shown in mirrored messages, e.g. "sky"
 
+	// OwnerName is who the agent is TALKING TO — used to label the priming
+	// prompt. Sub-agents serve someone else (Marilú, Rafa Tena), so hardcoding
+	// "rafiña" here made Sky greet rafiña's mom by his nickname.
+	OwnerName string
+
+	// BriefFile holds the "where we left off" note written by the nightly rollover
+	// and injected into the first message of the next session.
+	BriefFile string
+
 	FFmpegBin string
 
 	WhisperBin   string
@@ -77,7 +86,9 @@ func Load() (Config, error) {
 		MaxFileBytes: getint64("ZORO_MAX_FILE_BYTES", 20*1024*1024),
 		MirrorChatID: getint64("ZORO_MIRROR_CHAT_ID", 0),
 		AgentName:    getenv("ZORO_AGENT_NAME", "zoro"),
+		OwnerName:    getenv("ZORO_OWNER_NAME", "rafiña"),
 	}
+	c.BriefFile = getenv("ZORO_BRIEF_FILE", filepath.Join(c.StateDir, "brief.md"))
 	c.SoulFile = getenv("ZORO_SOUL_FILE", filepath.Join(c.ZoroHome, "soul.md"))
 	c.ContextFile = getenv("ZORO_CONTEXT_FILE", filepath.Join(c.ZoroHome, "context.md"))
 	c.CronFile = getenv("ZORO_CRON_FILE", filepath.Join(c.ZoroHome, "crons.json"))

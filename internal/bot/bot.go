@@ -99,6 +99,13 @@ type job struct {
 	prompt    string        // pre-built prompt for synthetic jobs (/compact, /voice)
 	wantVoice bool
 	isCompact bool
+
+	// label replaces the raw prompt in the mirror. Machine-made prompts (crons,
+	// the nightly rollover) are long internal instructions that are pure noise to
+	// whoever is watching — they want to see WHAT fired, not its wording.
+	label string
+	// isRollover: close the day, then rotate to a fresh session (see cron.Job.Rollover).
+	isRollover bool
 }
 
 // collectWindow is how long the collector waits for more messages before
@@ -526,6 +533,14 @@ func (b *Bot) process(parent context.Context, j job) {
 	// even on the voice path below (which returns early).
 	b.mirror(parent, j, prompt, reply)
 
+	// The nightly close answers to the machine, not to the chat: mom and dad must
+	// not get a 1am message. finishRollover reports to the watcher instead.
+	if j.isRollover {
+		b.finishRollover(parent, j, reply)
+		b.sendOutbox(parent, j.chatID, before)
+		return
+	}
+
 	// Voice reply (mirror modality): synthesize into a temp dir (not the outbox).
 	if wantVoice && b.tts.Available() && reply != "" {
 		if ogg, terr := tts.Synthesize(ctx, b.tts, reply, b.ttsDir); terr == nil {
@@ -576,15 +591,56 @@ func (b *Bot) mirror(ctx context.Context, j job, userText, reply string) {
 	if id == 0 || id == j.chatID {
 		return // mirroring off, or the watcher is the one talking
 	}
+	// A machine-made turn shows its label; only a human's turn shows the text itself.
+	shown := strings.TrimSpace(userText)
+	if j.label != "" {
+		shown = j.label
+	}
 	var sb strings.Builder
 	sb.WriteString("🪞 " + b.cfg.AgentName + " · " + senderName(j) + "\n\n")
-	sb.WriteString("👤 " + truncate(strings.TrimSpace(userText), 1500))
+	sb.WriteString("👤 " + truncate(shown, 1500))
 	if r := strings.TrimSpace(reply); r != "" {
 		sb.WriteString("\n\n🤖 " + truncate(r, 2500))
 	} else {
 		sb.WriteString("\n\n🤖 (no reply)")
 	}
 	b.send(ctx, id, sb.String())
+}
+
+// finishRollover closes the day: it saves the brief the agent just wrote and rotates
+// to a FRESH session, so tomorrow starts on clean context instead of an ever-growing
+// transcript. The brief is what carries continuity across the cut — it's injected
+// into the first message of the new session by primeWithContext.
+//
+// It reports to the mirror when there is one (rafiña), NOT to the chat: the whole
+// point is that his mom and dad never see a 1am message. Any failure leaves the
+// current session untouched — losing the thread silently would be worse than a
+// transcript that grew one more day.
+func (b *Bot) finishRollover(ctx context.Context, j job, brief string) {
+	dest := b.cfg.MirrorChatID
+	if dest == 0 {
+		dest = j.chatID
+	}
+	brief = strings.TrimSpace(brief)
+	if brief == "" {
+		b.log.Warn("rollover produced no brief, keeping session")
+		b.send(ctx, dest, "🌙 "+b.cfg.AgentName+": the close-of-day produced no brief — keeping the current session.")
+		return
+	}
+	if err := os.WriteFile(b.cfg.BriefFile, []byte(brief), 0o644); err != nil {
+		b.log.Warn("rollover: could not save brief", "err", err)
+		b.send(ctx, dest, "🌙 "+b.cfg.AgentName+": couldn't save the brief ("+err.Error()+") — keeping the current session.")
+		return
+	}
+	st, err := b.store.New()
+	if err != nil {
+		b.log.Warn("rollover: could not rotate session", "err", err)
+		b.send(ctx, dest, "🌙 "+b.cfg.AgentName+": brief saved, but the session did NOT rotate ("+err.Error()+").")
+		return
+	}
+	b.log.Info("rollover done", "session", st.SessionID)
+	b.send(ctx, dest, "🌙 Cierre del día — "+b.cfg.AgentName+"\n\n"+brief+
+		"\n\n———\n🧹 Sesión nueva, contexto limpio. Este brief entra en el primer mensaje de mañana.")
 }
 
 // senderName labels a mirrored turn with whoever caused it. Jobs with no source
@@ -613,13 +669,22 @@ func (b *Bot) systemPrompt() string {
 // primeWithContext prepends the durable background (~/.zoro/context.md) to the first
 // message of a new session, so it enters the conversation history once. Returns the
 // prompt unchanged if there is no context file.
+//
+// The owner is named from ZORO_OWNER_NAME, NOT hardcoded: sub-agents serve someone
+// else, and "rafiña" baked in here is why Sky greeted rafiña's mom by his nickname.
 func (b *Bot) primeWithContext(userPrompt string) string {
 	c := readFile(b.cfg.ContextFile)
 	if c == "" {
 		return userPrompt
 	}
-	return "[SESSION CONTEXT — durable background about rafiña, loaded once at the start of this conversation. Your identity and behavior rules are in your system prompt.]\n\n" +
-		c + "\n\n---\n\nrafiña: " + userPrompt
+	who := b.cfg.OwnerName
+	out := "[SESSION CONTEXT — durable background about " + who + ", loaded once at the start of this conversation. Your identity and behavior rules are in your system prompt.]\n\n" + c
+	// The nightly rollover cuts the transcript; this brief is what carries the
+	// thread across the cut, so a clean session doesn't mean a forgetful one.
+	if brief := readFile(b.cfg.BriefFile); brief != "" {
+		out += "\n\n---\n\n[BRIEF — cómo cerró el día anterior y en qué se quedó la conversación. Escrito por ti mismo en el cierre nocturno.]\n\n" + brief
+	}
+	return out + "\n\n---\n\n" + who + ": " + userPrompt
 }
 
 func readFile(path string) string {
@@ -878,9 +943,20 @@ func (b *Bot) handleBtw(chatID int64, question string) {
 // fireCron enqueues a scheduled job's prompt as a normal turn to the owner. The
 // wrapper tells the model this is an automatic trigger so it replies concisely.
 func (b *Bot) fireCron(j cron.Job) {
+	if j.Rollover {
+		// The rollover prompt is an instruction to the agent, not a reminder to the
+		// owner, so it skips the "mándame el resultado como un aviso" framing.
+		b.enqueue(job{
+			chatID:     b.cfg.OwnerID,
+			prompt:     "[🌙 Cierre del día \"" + j.ID + "\" — tarea interna, automática. No es un mensaje de tu usuario.]\n\n" + j.Prompt,
+			label:      "🌙 cierre del día (" + j.ID + ")",
+			isRollover: true,
+		})
+		return
+	}
 	prompt := "[⏰ Cron automático \"" + j.ID + "\" — disparado a su hora programada (CDMX). " +
 		"Atiende esto y mándame el resultado de forma breve, como un recordatorio/aviso:]\n\n" + j.Prompt
-	b.enqueue(job{chatID: b.cfg.OwnerID, prompt: prompt})
+	b.enqueue(job{chatID: b.cfg.OwnerID, prompt: prompt, label: "⏰ cron \"" + j.ID + "\""})
 }
 
 // findCron loads crons.json and returns the entry matching ref, which can be a
