@@ -119,3 +119,30 @@ func TestPrimeWithContextIncludesBrief(t *testing.T) {
 		t.Error("brief must come before the user message, not after it")
 	}
 }
+
+// The mirror label used to show the Telegram first name, and rafiña's dad is
+// literally called "Rafa" there — so every one of his turns read as if rafiña
+// had written it. The primary owner now gets labelled with ZORO_OWNER_NAME.
+func TestSenderNamePrefersOwnerName(t *testing.T) {
+	cases := []struct {
+		name      string
+		ownerName string
+		from      *tg.User
+		want      string
+	}{
+		{"owner uses configured name", "Rafa Tena", &tg.User{ID: 7, FirstName: "Rafa"}, "Rafa Tena"},
+		{"non-owner keeps first name", "Marilú", &tg.User{ID: 99, FirstName: "Juan"}, "Juan"},
+		{"owner without configured name falls back", "", &tg.User{ID: 7, FirstName: "Rafa"}, "Rafa"},
+		{"no first name falls back to username", "", &tg.User{ID: 99, Username: "noesrafa"}, "noesrafa"},
+		{"no sender at all is a cron", "Marilú", nil, "⏰ cron"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b := &Bot{cfg: config.Config{OwnerID: 7, OwnerName: c.ownerName}}
+			j := job{msgs: []*tg.Message{{From: c.from}}}
+			if got := b.senderName(j); got != c.want {
+				t.Errorf("senderName() = %q, want %q", got, c.want)
+			}
+		})
+	}
+}

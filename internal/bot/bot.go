@@ -597,7 +597,7 @@ func (b *Bot) mirror(ctx context.Context, j job, userText, reply string) {
 		shown = j.label
 	}
 	var sb strings.Builder
-	sb.WriteString("🪞 " + b.cfg.AgentName + " · " + senderName(j) + "\n\n")
+	sb.WriteString("🪞 " + b.cfg.AgentName + " · " + b.senderName(j) + "\n\n")
 	sb.WriteString("👤 " + truncate(shown, 1500))
 	if r := strings.TrimSpace(reply); r != "" {
 		sb.WriteString("\n\n🤖 " + truncate(r, 2500))
@@ -645,10 +645,19 @@ func (b *Bot) finishRollover(ctx context.Context, j job, brief string) {
 
 // senderName labels a mirrored turn with whoever caused it. Jobs with no source
 // message are scheduled ones.
-func senderName(j job) string {
+//
+// The primary owner is labelled with ZORO_OWNER_NAME instead of their Telegram
+// first name: rafiña's dad is literally called "Rafa" there, so the mirror of
+// experienciaXXI read as if rafiña had written the messages himself.
+func (b *Bot) senderName(j job) string {
 	for _, m := range j.msgs {
 		if m.From == nil {
 			continue
+		}
+		if m.From.ID == b.cfg.OwnerID {
+			if n := strings.TrimSpace(b.cfg.OwnerName); n != "" {
+				return n
+			}
 		}
 		if n := strings.TrimSpace(m.From.FirstName); n != "" {
 			return n
