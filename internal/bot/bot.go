@@ -4,6 +4,7 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -453,6 +454,7 @@ func (b *Bot) process(parent context.Context, j job) {
 	if !st.Created {
 		turnPrompt = b.primeWithContext(prompt)
 	}
+	wasNew := !st.Created
 	res, err := b.cd.Run(ctx, st.SessionID, !st.Created, turnPrompt, opts)
 	if err != nil && ctx.Err() != nil {
 		return // cancelled / shutting down
@@ -478,6 +480,29 @@ func (b *Bot) process(parent context.Context, j job) {
 		if res.SessionID != "" {
 			_ = b.store.Set(res.SessionID, true)
 		}
+		// The Claude credential is SHARED with the sub-agents (sky, expxxi). The access
+		// token lives ~8h and refreshing it ROTATES the refresh token, so whoever loses
+		// that race is left holding a stale copy — which is exactly this error. A healer
+		// unit promotes the newest credential every 2 minutes, so the repair is already
+		// on its way; waiting for its timer would just throw the turn away. Kick it now
+		// and retry ONCE. Measured 2026-08-20: this fired ~once a day and every single
+		// time the credential was healthy again minutes later.
+		if b.healCredentials(ctx) {
+			retryPrompt := prompt
+			if wasNew {
+				retryPrompt = turnPrompt // the prime never landed; resend it
+			}
+			st = b.store.Current()
+			res, err = b.cd.Run(ctx, st.SessionID, false, retryPrompt, opts)
+			if err == nil {
+				b.log.Warn("claude auth failure — credential healed, turn recovered on retry")
+			}
+		}
+		if err != nil && ctx.Err() != nil {
+			return // cancelled while healing
+		}
+	}
+	if err != nil && res.Failure() == claude.FailAuth {
 		b.log.Error("claude auth failure", "detail", res.Diagnostic())
 		msg := b.failureText(res, err)
 		b.send(parent, j.chatID, msg)
@@ -563,6 +588,57 @@ func (b *Bot) process(parent context.Context, j job) {
 	b.sendOutbox(parent, j.chatID, before)
 }
 
+// healCredentials kicks the root-owned unit that promotes the newest shared Claude
+// credential to /var/lib/claudeshare and re-links the sub-agents' symlinks. Its timer
+// runs every 2 minutes on its own; triggering it here turns a ~2 minute wait into a
+// couple of seconds, which is the difference between a recovered turn and a dead one.
+func (b *Bot) healCredentials(ctx context.Context) bool {
+	c, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := exec.CommandContext(c, "sudo", "-n", "systemctl", "start", "claude-cred-sync.service").Run(); err != nil {
+		b.log.Warn("could not trigger the credential healer", "err", err)
+		return false
+	}
+	select {
+	case <-time.After(3 * time.Second): // let the new file settle before re-running the CLI
+	case <-ctx.Done():
+		return false
+	}
+	return true
+}
+
+// credentialsPath is this user's Claude credential. Derived from $HOME on purpose:
+// hardcoding /home/rafael is what silently broke woods and ZORO_OWNER_NAME when things
+// moved to isolated users.
+func credentialsPath() string {
+	h, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(h, ".claude", ".credentials.json")
+}
+
+// refreshTokenAlive reports whether the LONG-lived refresh token (~30 days) is still
+// valid. Two different tokens die here and conflating them costs rafiña a pointless
+// chore: the access token (~8h) renews itself and only needs the healer, while the
+// refresh token is the ONLY one that needs a browser login.
+func refreshTokenAlive() (bool, time.Time) {
+	raw, err := os.ReadFile(credentialsPath())
+	if err != nil {
+		return false, time.Time{} // unreadable: don't claim it's fine
+	}
+	var doc struct {
+		OAuth struct {
+			RefreshTokenExpiresAt int64 `json:"refreshTokenExpiresAt"`
+		} `json:"claudeAiOauth"`
+	}
+	if json.Unmarshal(raw, &doc) != nil || doc.OAuth.RefreshTokenExpiresAt == 0 {
+		return false, time.Time{}
+	}
+	exp := time.UnixMilli(doc.OAuth.RefreshTokenExpiresAt)
+	return time.Now().Before(exp), exp
+}
+
 // failureText turns a failed turn into something a human can act on. The CLI's own
 // words (stdout) beat the process error, because the failures that matter most —
 // the OAuth session dying above all — exit 1 with a COMPLETELY EMPTY stderr, which
@@ -570,7 +646,18 @@ func (b *Bot) process(parent context.Context, j job) {
 func (b *Bot) failureText(res claude.Result, err error) string {
 	switch res.Failure() {
 	case claude.FailAuth:
-		return "🔒 I died on login — my Claude session expired and couldn't be refreshed.\n\n" +
+		// Only send him to /login when the refresh token is actually dead. Before
+		// 2026-08-20 this always said "run /login", which was wrong advice on the
+		// common case (a shared-token race that heals itself in minutes).
+		if alive, exp := refreshTokenAlive(); alive {
+			return "🔒 Token hiccup — my access token went stale. I share the login with sky and " +
+				"experienciaXXI, and whoever refreshes first rotates it, so sometimes I lose the race.\n\n" +
+				"I already triggered the repair and retried, but this turn didn't make it. " +
+				"**You don't need to log in** — just send that message again.\n\n" +
+				"Your real login is good until " + exp.Format("Jan 2") + ".\n\n" +
+				"CLI said: " + truncate(res.Diagnostic(), 300)
+		}
+		return "🔒 My Claude login really died — the refresh token expired, so this one needs you.\n\n" +
 			"Nothing is lost: the conversation is intact and I'll pick it up as soon as you log in again " +
 			"(on the VPS: run `claude` → `/login`).\n\n" +
 			"CLI said: " + truncate(res.Diagnostic(), 400)
