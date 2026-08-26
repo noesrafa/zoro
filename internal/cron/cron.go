@@ -8,13 +8,20 @@
 //     (hot-reload) — no restart needed.
 //   - We use robfig/cron only as a battle-tested PARSER (standard 5-field specs);
 //     the loop itself is a plain per-minute tick, which keeps reload trivial.
+//   - Every occurrence is drifted by a few deterministic minutes (see jitterWindow).
+//     Several agents share one upstream account, and crons written by hand cluster on
+//     round times, so without this they all wake on the same instant of the same
+//     minute and hammer it together.
 package cron
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"io"
 	"os"
+	"strconv"
 	"time"
 
 	cronparser "github.com/robfig/cron/v3"
@@ -86,13 +93,53 @@ func NextRuns(j Job, loc *time.Location, n int) ([]time.Time, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Report the drifted times — these are when the job actually fires, and `cron
+	// list` showing a clean "03:00" for something that runs at 02:57 is a lie that
+	// costs an hour the next time a fire looks late.
 	out := make([]time.Time, 0, n)
 	t := time.Now().In(loc)
 	for i := 0; i < n; i++ {
 		t = sched.Next(t)
-		out = append(out, t)
+		out = append(out, t.Add(drift(j.ID, sched, t)))
 	}
 	return out, nil
+}
+
+// jitterWindow is how far, in each direction, an occurrence may drift from its
+// scheduled minute. "0 1 * * *" on three agents means three simultaneous calls on
+// one shared login; spreading them over an 11-minute band costs nothing and stops
+// them colliding.
+const jitterWindow = 5 * time.Minute
+
+// minSpacing is the tightest schedule we are willing to drift. Occurrences closer
+// together than this could, once drifted independently, overlap or swap order — so
+// frequent schedules ("*/5 * * * *") are left exactly on their marks.
+const minSpacing = 15 * time.Minute
+
+// instanceSalt keeps the drift different between agents running this same engine.
+// zoro, sky and expxxi each have a job whose ID is "cierre-del-dia" on "0 1 * * *";
+// hashing only the ID and the occurrence would hand all three the SAME drift, so
+// they would still fire on the same instant — the exact collision the jitter exists
+// to break. The uid is stable per agent and needs no plumbing to reach here.
+var instanceSalt = strconv.Itoa(os.Getuid())
+
+// drift returns the offset applied to one occurrence of one job: a whole number of
+// minutes in [-jitterWindow, +jitterWindow]. It is derived from the job ID and the
+// occurrence itself, never from the current time, which is what makes it safe — the
+// same occurrence always draws the same offset, so it lands in exactly one tick
+// window and fires exactly once, and a restart cannot shift a pending fire.
+func drift(id string, sched cronparser.Schedule, occ time.Time) time.Duration {
+	if sched.Next(occ).Sub(occ) < minSpacing {
+		return 0
+	}
+	h := fnv.New64a()
+	io.WriteString(h, instanceSalt)
+	io.WriteString(h, "/")
+	io.WriteString(h, id)
+	io.WriteString(h, "@")
+	io.WriteString(h, occ.UTC().Format(time.RFC3339))
+	steps := int64(jitterWindow/time.Minute)*2 + 1 // -5..+5 inclusive
+	return time.Duration(int64(h.Sum64()%uint64(steps))-int64(jitterWindow/time.Minute)) * time.Minute
 }
 
 // due reports whether j should fire in the window (last, now] given its schedule.
@@ -101,8 +148,22 @@ func due(j Job, loc *time.Location, last, now time.Time) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	next := sched.Next(last.In(loc))
-	return !next.After(now.In(loc)), nil
+	// Scan every occurrence that could land in this window once drifted: a negative
+	// drift pulls a later occurrence in, a positive one pushes an earlier occurrence
+	// forward, so widen the search by jitterWindow on both sides. The windows the
+	// caller passes tile the timeline without gaps or overlaps, and each occurrence
+	// has one fixed drifted time, so this still fires exactly once per occurrence.
+	lo, hi := last.In(loc), now.In(loc)
+	for t := lo.Add(-jitterWindow); ; {
+		occ := sched.Next(t)
+		if occ.After(hi.Add(jitterWindow)) {
+			return false, nil
+		}
+		if at := occ.Add(drift(j.ID, sched, occ)); at.After(lo) && !at.After(hi) {
+			return true, nil
+		}
+		t = occ
+	}
 }
 
 // Logger is the minimal logging surface the scheduler needs.
