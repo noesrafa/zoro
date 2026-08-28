@@ -127,7 +127,7 @@ func (c Config) download(ctx context.Context, client *tg.Client, fileID string, 
 		ext = "bin"
 	}
 	dest := filepath.Join(c.InboxDir, fmt.Sprintf("%s-%s.%s",
-		time.Now().UTC().Format("20060102-150405"), uid.New()[:8], ext))
+		time.Now().Format("20060102-150405"), uid.New()[:8], ext))
 	if err := client.DownloadFile(ctx, f.FilePath, dest); err != nil {
 		return "", "", err
 	}
