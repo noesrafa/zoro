@@ -57,6 +57,8 @@ Commands:
 /btw <question> — side-question in parallel on Opus (researches freely, won't touch this chat)
 /crons — list scheduled messages (and next run)
 /crons <id> — fire that scheduled message now
+/tasks — tasks rafiña sent me (title + done-check)
+/coche — car card: plate, tire psi, hologram, gas, VIN
 /status — session, model, effort, uptime
 /uso — uso de Claude Code (límites 5h / 7d, snapshot oficial vía claude-hud)
 /ls [path] — list VM files
@@ -242,6 +244,10 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 			b.send(ctx, m.Chat.ID, b.statusText())
 		case "/uso", "/usage":
 			b.send(ctx, m.Chat.ID, usoText())
+		case "/tasks":
+			b.send(ctx, m.Chat.ID, tasksText())
+		case "/coche":
+			b.send(ctx, m.Chat.ID, cocheText())
 		case "/ls":
 			b.send(ctx, m.Chat.ID, b.listDir(firstArg(text, fields[0])))
 		case "/stats":
@@ -921,23 +927,14 @@ func (b *Bot) statusText() string {
 }
 
 func (b *Bot) registerCommands(ctx context.Context) {
+	// Menu shows ONLY what rafiña actually uses (his call, 8-sep-2026) + /tasks.
+	// Every other command keeps its handler — typing it still works; /help lists all.
 	cmds := []tg.BotCommand{
 		{Command: "newsession", Description: "Start a fresh conversation"},
-		{Command: "compact", Description: "Compact the conversation to free context"},
-		{Command: "model", Description: "Switch model (opus/sonnet/haiku/fable/claude-…)"},
-		{Command: "effort", Description: "Set reasoning effort (low/medium/high/xhigh/max)"},
-		{Command: "voice", Description: "Reply with a voice note: /voice <message>"},
-		{Command: "btw", Description: "Quick side-question in parallel: /btw <question>"},
-		{Command: "crons", Description: "List scheduled messages and next run"},
-		{Command: "status", Description: "Show session, model, effort, uptime"},
-		{Command: "uso", Description: "Claude Code usage (5h / 7d rate limits)"},
-		{Command: "ls", Description: "List VM files: /ls [path]"},
-		{Command: "stats", Description: "VM + git repo status"},
-		{Command: "cancel", Description: "Cancel the current task"},
 		{Command: "redeploy", Description: "Rebuild engine + restart (apply code changes)"},
-		{Command: "update", Description: "Pull latest code from GitHub + rebuild + restart"},
-		{Command: "restart", Description: "Restart the daemon"},
-		{Command: "help", Description: "Show help"},
+		{Command: "btw", Description: "Quick side-question in parallel: /btw <question>"},
+		{Command: "model", Description: "Switch model (opus/sonnet/haiku/fable/claude-…)"},
+		{Command: "tasks", Description: "List tasks (title + done)"},
 	}
 	if err := b.tg.SetMyCommands(ctx, cmds); err != nil {
 		b.log.Warn("setMyCommands failed", "err", err)
