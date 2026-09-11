@@ -50,6 +50,7 @@ Just talk to me: text, photos, PDFs or voice notes. I work inside /home/rafael w
 
 Commands:
 /newsession — start a fresh conversation
+/focus <project|off> — fresh session inside a project folder (/focus lists them; map in ~/.zoro/proyectos.json)
 /compact — compress context, keep memory
 /model <opus|sonnet|haiku|fable|claude-…> — switch model (persists)
 /effort <low|medium|high|xhigh|max> — set reasoning effort (persists)
@@ -264,6 +265,8 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 				return
 			}
 			b.send(ctx, m.Chat.ID, "🔄 New session — fresh memory.\n"+st.SessionID)
+		case "/focus":
+			b.handleFocus(ctx, m.Chat.ID, strings.ToLower(firstArg(text, fields[0])))
 		case "/cancel":
 			discarded := b.collector.Drop(m.Chat.ID) + b.drainJobs()
 			b.cancel()
@@ -451,9 +454,11 @@ func (b *Bot) process(parent context.Context, j job) {
 	before := media.SnapshotOutbox(b.cfg.OutboxDir)
 
 	cur := b.set.Get()
-	opts := claude.RunOpts{Model: cur.Model, Effort: cur.Effort, SystemPrompt: b.systemPrompt()}
-
 	st := b.store.Current()
+	// The session's cwd (/focus) rides along on EVERY turn — resuming from a
+	// different dir would fork the transcript.
+	opts := claude.RunOpts{Model: cur.Model, Effort: cur.Effort, SystemPrompt: b.systemPrompt(), WorkDir: st.WorkDir}
+
 	// On a NEW session, prime the conversation once with the heavy context.md
 	// (durable background about rafiña). On resumes it's already in history.
 	turnPrompt := prompt
@@ -913,12 +918,17 @@ func (b *Bot) statusText() string {
 		state = "active"
 	}
 	cur := b.set.Get()
+	foco := "—"
+	if st.WorkDir != "" {
+		foco = st.WorkDir
+	}
 	return strings.Join([]string{
 		"⚔️ zoro status",
 		"session: " + sid + " (" + state + ")",
 		"model: " + cur.Model,
 		"effort: " + cur.Effort,
 		"workdir: " + b.cfg.WorkDir,
+		"focus: " + foco,
 		fmt.Sprintf("last turn cost: $%.4f", cost),
 		"voice in (stt): " + onoff(b.mediaC.STT.Available()),
 		"voice out (tts): " + onoff(b.tts.Available()),
@@ -935,6 +945,7 @@ func (b *Bot) registerCommands(ctx context.Context) {
 		{Command: "btw", Description: "Quick side-question in parallel: /btw <question>"},
 		{Command: "model", Description: "Switch model (opus/sonnet/haiku/fable/claude-…)"},
 		{Command: "tasks", Description: "List tasks (title + done)"},
+		{Command: "focus", Description: "Fresh session inside a project: /focus <name|off>"},
 	}
 	if err := b.tg.SetMyCommands(ctx, cmds); err != nil {
 		b.log.Warn("setMyCommands failed", "err", err)

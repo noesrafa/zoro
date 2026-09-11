@@ -82,6 +82,7 @@ type RunOpts struct {
 	Model        string
 	Effort       string
 	SystemPrompt string // overrides cfg.SystemPrompt; read fresh each turn for hot-reload
+	WorkDir      string // overrides cfg.WorkDir (/focus) — MUST stay constant within a session
 }
 
 type Driver struct{ cfg Config }
@@ -131,6 +132,9 @@ type event struct {
 func (d *Driver) Run(ctx context.Context, sessionID string, create bool, prompt string, o RunOpts) (Result, error) {
 	cmd := exec.CommandContext(ctx, d.cfg.Bin, d.args(sessionID, create, prompt, o)...)
 	cmd.Dir = d.cfg.WorkDir
+	if o.WorkDir != "" {
+		cmd.Dir = o.WorkDir
+	}
 	cmd.Env = scrubEnv(os.Environ())
 
 	stdout, err := cmd.StdoutPipe()

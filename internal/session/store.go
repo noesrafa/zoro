@@ -15,6 +15,7 @@ import (
 type State struct {
 	SessionID string `json:"session_id"`
 	Created   bool   `json:"created"` // whether the id has been used to create a session
+	WorkDir   string `json:"work_dir,omitempty"` // /focus: cwd of this session ("" = home); constant per session
 	UpdatedAt string `json:"updated_at"`
 }
 
@@ -34,7 +35,10 @@ func Open(dir string) (*Store, error) {
 	if b, err := os.ReadFile(s.path); err == nil {
 		_ = json.Unmarshal(b, &s.st)
 	}
-	if s.st.SessionID == "" {
+	// A focused session does NOT survive a restart (rafiña's call, 10-sep-2026):
+	// rotate it away at boot. Resuming it from home would also fork the
+	// transcript — the CLI keys conversations by cwd.
+	if s.st.SessionID == "" || s.st.WorkDir != "" {
 		s.st = State{SessionID: uid.New(), Created: false, UpdatedAt: now()}
 		if err := s.save(); err != nil {
 			return nil, err
@@ -59,11 +63,15 @@ func (s *Store) MarkCreated() error {
 	return s.save()
 }
 
-// New rotates to a brand-new, uncreated session id.
-func (s *Store) New() (State, error) {
+// New rotates to a brand-new, uncreated session id (home, no focus).
+func (s *Store) New() (State, error) { return s.NewIn("") }
+
+// NewIn rotates to a brand-new session that will live inside dir (/focus).
+// The cwd is decided at rotation and never changes for the session's lifetime.
+func (s *Store) NewIn(dir string) (State, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.st = State{SessionID: uid.New(), Created: false, UpdatedAt: now()}
+	s.st = State{SessionID: uid.New(), Created: false, WorkDir: dir, UpdatedAt: now()}
 	return s.st, s.save()
 }
 
