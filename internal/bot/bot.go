@@ -945,6 +945,7 @@ func (b *Bot) registerCommands(ctx context.Context) {
 		{Command: "btw", Description: "Quick side-question in parallel: /btw <question>"},
 		{Command: "model", Description: "Switch model (opus/sonnet/haiku/fable/claude-…)"},
 		{Command: "tasks", Description: "List tasks (title + done)"},
+		{Command: "coche", Description: "Car card: pressures, Hoy No Circula, gas"},
 		{Command: "focus", Description: "Fresh session inside a project: /focus <name|off>"},
 	}
 	if err := b.tg.SetMyCommands(ctx, cmds); err != nil {
