@@ -60,6 +60,7 @@ Commands:
 /crons <id> — fire that scheduled message now
 /tasks — tasks rafiña sent me (title + done-check)
 /coche — car card: plate, tire psi, hologram, gas, VIN
+/percance — roadside emergency card: insurer phones + policy data
 /status — session, model, effort, uptime
 /uso — uso de Claude Code (límites 5h / 7d, snapshot oficial vía claude-hud)
 /ls [path] — list VM files
@@ -249,6 +250,10 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 			b.send(ctx, m.Chat.ID, tasksText())
 		case "/coche":
 			b.send(ctx, m.Chat.ID, cocheText())
+		case "/percance":
+			// reply, not send: the card uses `backticks` so numbers render as
+			// tap-to-copy monospace in Telegram
+			b.reply(ctx, m.Chat.ID, percanceText())
 		case "/ls":
 			b.send(ctx, m.Chat.ID, b.listDir(firstArg(text, fields[0])))
 		case "/stats":
@@ -515,9 +520,7 @@ func (b *Bot) process(parent context.Context, j job) {
 	}
 	if err != nil && res.Failure() == claude.FailAuth {
 		b.log.Error("claude auth failure", "detail", res.Diagnostic())
-		msg := b.failureText(res, err)
-		b.send(parent, j.chatID, msg)
-		b.mirror(parent, j, prompt, msg)
+		b.reportFailure(parent, j, prompt, b.failureText(res, err))
 		return
 	}
 	if err != nil && st.Created {
@@ -528,7 +531,12 @@ func (b *Bot) process(parent context.Context, j job) {
 		b.log.Warn("resume failed, starting new session", "err", err)
 		if ns, nerr := b.store.New(); nerr == nil {
 			st = ns
-			b.send(parent, j.chatID, "⚠️ Couldn't resume the previous conversation (resume failed) — started a NEW one, so the prior thread is gone. Error:\n"+truncate(resumeErr.Error(), 800))
+			note := "⚠️ Couldn't resume the previous conversation (resume failed) — started a NEW one, so the prior thread is gone. Error:\n" + truncate(resumeErr.Error(), 800)
+			if dest := b.failDest(j); dest != j.chatID {
+				b.send(parent, dest, j.label+" — "+note)
+			} else {
+				b.send(parent, dest, note)
+			}
 			res, err = b.cd.Run(ctx, st.SessionID, true, b.primeWithContext(prompt), opts)
 		}
 	}
@@ -536,9 +544,7 @@ func (b *Bot) process(parent context.Context, j job) {
 		if ctx.Err() != nil {
 			return
 		}
-		msg := b.failureText(res, err)
-		b.send(parent, j.chatID, msg)
-		b.mirror(parent, j, prompt, msg)
+		b.reportFailure(parent, j, prompt, b.failureText(res, err))
 		return
 	}
 
@@ -657,15 +663,16 @@ func refreshTokenAlive() (bool, time.Time) {
 func (b *Bot) failureText(res claude.Result, err error) string {
 	switch res.Failure() {
 	case claude.FailAuth:
-		// Only send him to /login when the refresh token is actually dead. Before
-		// 2026-08-20 this always said "run /login", which was wrong advice on the
-		// common case (a shared-token race that heals itself in minutes).
+		// Only send him to /login when the refresh token is actually dead. Since
+		// 2026-08-25 every agent holds its OWN login (no more shared-token races),
+		// so a stale access token here is a transient refresh blip, not a shared
+		// rotation lost to a sibling agent.
 		if alive, exp := refreshTokenAlive(); alive {
-			return "🔒 Token hiccup — my access token went stale. I share the login with sky and " +
-				"experienciaXXI, and whoever refreshes first rotates it, so sometimes I lose the race.\n\n" +
-				"I already triggered the repair and retried, but this turn didn't make it. " +
-				"**You don't need to log in** — just send that message again.\n\n" +
-				"Your real login is good until " + exp.Format("Jan 2") + ".\n\n" +
+			return "🔒 Token hiccup — my access token went stale and the refresh didn't land " +
+				"this time (usually a one-off network/API blip).\n\n" +
+				"I retried and this turn still didn't make it. **You don't need to log in** — " +
+				"just send that message again.\n\n" +
+				"The real login is good until " + exp.Format("Jan 2") + ".\n\n" +
 				"CLI said: " + truncate(res.Diagnostic(), 300)
 		}
 		return "🔒 My Claude login really died — the refresh token expired, so this one needs you.\n\n" +
@@ -679,6 +686,31 @@ func (b *Bot) failureText(res claude.Result, err error) string {
 		return "⚠️ " + truncate(d, 1500)
 	}
 	return "⚠️ " + truncate(err.Error(), 1500)
+}
+
+// failDest picks where a failed turn reports. A human's failed turn goes to the
+// chat that asked — they need to know their message died. A machine-made turn
+// (label != "": crons, the nightly rollover) reports to the mirror when there is
+// one: the support owner can act on a technical error at 1am; the primary owner
+// can only be confused by it. Same rule finishRollover applies on the happy path.
+func (b *Bot) failDest(j job) int64 {
+	if j.label != "" && b.cfg.MirrorChatID != 0 {
+		return b.cfg.MirrorChatID
+	}
+	return j.chatID
+}
+
+// reportFailure delivers a terminal turn failure. A machine failure diverted to
+// the mirror carries the job label so it reads as "what broke", not a bare error;
+// a human failure keeps the normal chat delivery + mirror echo.
+func (b *Bot) reportFailure(ctx context.Context, j job, prompt, msg string) {
+	dest := b.failDest(j)
+	if dest != j.chatID {
+		b.send(ctx, dest, "⚠️ "+j.label+" failed —\n\n"+msg)
+		return
+	}
+	b.send(ctx, dest, msg)
+	b.mirror(ctx, j, prompt, msg)
 }
 
 // mirror echoes a finished turn to ZORO_MIRROR_CHAT_ID through this same bot, so
@@ -769,8 +801,22 @@ func (b *Bot) senderName(j job) string {
 
 // systemPrompt reads the agent's soul FRESH each turn from ~/.zoro/soul.md (identity +
 // behavior). Editing it takes effect on the next message, no restart needed.
+// maxInject caps any single injected blob well under the kernel's 128 KiB
+// per-exec-argument limit (MAX_ARG_STRLEN): a fat context.md must degrade to a
+// truncated injection, never to fork/exec "argument list too long" killing every
+// turn — that's what took Sky down the night of 13-sep-2026.
+const maxInject = 100_000
+
+func (b *Bot) capInject(s, name string) string {
+	if len(s) <= maxInject {
+		return s
+	}
+	b.log.Warn("inyección truncada por límite de exec", "archivo", name, "bytes", len(s), "límite", maxInject)
+	return s[:maxInject] + "\n\n[⚠️ TRUNCADO: " + name + " pasó el límite de inyección — hay que podarlo]"
+}
+
 func (b *Bot) systemPrompt() string {
-	return readFile(b.cfg.SoulFile)
+	return b.capInject(readFile(b.cfg.SoulFile), "soul")
 }
 
 // primeWithContext prepends the durable background (~/.zoro/context.md) to the first
@@ -780,7 +826,7 @@ func (b *Bot) systemPrompt() string {
 // The owner is named from ZORO_OWNER_NAME, NOT hardcoded: sub-agents serve someone
 // else, and "rafiña" baked in here is why Sky greeted rafiña's mom by his nickname.
 func (b *Bot) primeWithContext(userPrompt string) string {
-	c := readFile(b.cfg.ContextFile)
+	c := b.capInject(readFile(b.cfg.ContextFile), "context")
 	if c == "" {
 		return userPrompt
 	}
@@ -946,6 +992,7 @@ func (b *Bot) registerCommands(ctx context.Context) {
 		{Command: "model", Description: "Switch model (opus/sonnet/haiku/fable/claude-…)"},
 		{Command: "tasks", Description: "List tasks (title + done)"},
 		{Command: "coche", Description: "Car card: pressures, Hoy No Circula, gas"},
+		{Command: "percance", Description: "🚨 Emergencia vial: seguro, teléfonos, qué hacer"},
 		{Command: "focus", Description: "Fresh session inside a project: /focus <name|off>"},
 	}
 	if err := b.tg.SetMyCommands(ctx, cmds); err != nil {
