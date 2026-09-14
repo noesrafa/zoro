@@ -849,30 +849,51 @@ func readFile(path string) string {
 }
 
 func (b *Bot) sendOutbox(ctx context.Context, chatID int64, before map[string]time.Time) {
+	// Every outbox file also echoes to the mirror (when set): the watcher must
+	// SEE what a sub-agent sends its owner (logos, PDFs, fotos), not just read
+	// the text around it. Pedido por rafiña el 13-sep-2026.
+	dests := []int64{chatID}
+	if id := b.cfg.MirrorChatID; id != 0 && id != chatID {
+		dests = append(dests, id)
+	}
 	for _, f := range media.NewOutboxFiles(b.cfg.OutboxDir, before) {
 		ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(f), "."))
-		var err error
 		switch ext {
 		case "jpg", "jpeg", "png", "webp", "gif":
 			// Shrink oversized images first, then route by size: Telegram's
 			// sendPhoto silently rejects files over 10 MiB, so anything still
 			// above that goes out as a document (preserved, up to 50 MiB).
 			send := media.OptimizeImage(f)
+			big := false
 			if fi, serr := os.Stat(send); serr == nil && fi.Size() > media.PhotoMaxBytes {
-				err = b.tg.SendDocument(ctx, chatID, send, "")
-			} else {
-				err = b.tg.SendPhoto(ctx, chatID, send, "")
+				big = true
+			}
+			for _, d := range dests {
+				var err error
+				if big {
+					err = b.tg.SendDocument(ctx, d, send, "")
+				} else {
+					err = b.tg.SendPhoto(ctx, d, send, "")
+				}
+				if err != nil {
+					b.log.Warn("send outbox file failed", "file", f, "chat", d, "err", err)
+				}
 			}
 			if send != f {
 				os.Remove(send)
 			}
 		case "ogg", "oga":
-			err = b.tg.SendVoice(ctx, chatID, f, "")
+			for _, d := range dests {
+				if err := b.tg.SendVoice(ctx, d, f, ""); err != nil {
+					b.log.Warn("send outbox file failed", "file", f, "chat", d, "err", err)
+				}
+			}
 		default:
-			err = b.tg.SendDocument(ctx, chatID, f, "")
-		}
-		if err != nil {
-			b.log.Warn("send outbox file failed", "file", f, "err", err)
+			for _, d := range dests {
+				if err := b.tg.SendDocument(ctx, d, f, ""); err != nil {
+					b.log.Warn("send outbox file failed", "file", f, "chat", d, "err", err)
+				}
+			}
 		}
 	}
 }
