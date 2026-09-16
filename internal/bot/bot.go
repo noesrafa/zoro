@@ -54,6 +54,7 @@ Commands:
 /compact — compress context, keep memory
 /model <opus|sonnet|haiku|fable|claude-…> — switch model (persists)
 /effort <low|medium|high|xhigh|max> — set reasoning effort (persists)
+/idioma <es|en> — force Spanish replies, or back to the soul's English default (persists)
 /voice <msg> — reply with a voice note
 /btw <question> — side-question in parallel on Opus (researches freely, won't touch this chat)
 /crons — list scheduled messages (and next run)
@@ -327,6 +328,30 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 				return
 			}
 			b.send(ctx, m.Chat.ID, "✅ effort → "+arg+" (persists across sessions)")
+		case "/idioma", "/english":
+			arg := strings.ToLower(firstArg(text, fields[0]))
+			switch arg {
+			case "":
+				cur := b.set.Get().Idioma
+				if cur == "" {
+					cur = "en"
+				}
+				b.send(ctx, m.Chat.ID, "idioma: "+cur+"\nUsage: /idioma <es|en>")
+			case "es", "español", "espanol", "spanish":
+				if err := b.set.SetIdioma("es"); err != nil {
+					b.send(ctx, m.Chat.ID, "⚠️ "+err.Error())
+					return
+				}
+				b.send(ctx, m.Chat.ID, "✅ idioma → español (persiste entre sesiones; /idioma en para volver)")
+			case "en", "ingles", "inglés", "english":
+				if err := b.set.SetIdioma("en"); err != nil {
+					b.send(ctx, m.Chat.ID, "⚠️ "+err.Error())
+					return
+				}
+				b.send(ctx, m.Chat.ID, "✅ idioma → english (soul default back in charge)")
+			default:
+				b.send(ctx, m.Chat.ID, "⚠️ Usage: /idioma <es|en>")
+			}
 		case "/voice":
 			rest := strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
 			if rest == "" {
@@ -816,7 +841,13 @@ func (b *Bot) capInject(s, name string) string {
 }
 
 func (b *Bot) systemPrompt() string {
-	return b.capInject(readFile(b.cfg.SoulFile), "soul")
+	soul := b.capInject(readFile(b.cfg.SoulFile), "soul")
+	// Language switch (/idioma): an explicit "es" must beat the soul's
+	// English-output mandate, so it is appended AFTER the soul.
+	if b.set.Get().Idioma == "es" {
+		soul += "\n\n[🔀 SWITCH DE IDIOMA: ESPAÑOL — activado por el owner con /idioma es. Esta orden PISA cualquier mandato del soul de responder en inglés: responde TODO en español (mensajes, crons, avisos) hasta que el switch vuelva a en. Las demás reglas del soul siguen intactas.]"
+	}
+	return soul
 }
 
 // primeWithContext prepends the durable background (~/.zoro/context.md) to the first
@@ -1015,6 +1046,7 @@ func (b *Bot) registerCommands(ctx context.Context) {
 		{Command: "coche", Description: "Car card: pressures, Hoy No Circula, gas"},
 		{Command: "percance", Description: "🚨 Emergencia vial: seguro, teléfonos, qué hacer"},
 		{Command: "focus", Description: "Fresh session inside a project: /focus <name|off>"},
+		{Command: "idioma", Description: "Switch idioma: /idioma es|en"},
 	}
 	if err := b.tg.SetMyCommands(ctx, cmds); err != nil {
 		b.log.Warn("setMyCommands failed", "err", err)

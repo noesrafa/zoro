@@ -13,6 +13,9 @@ import (
 type Settings struct {
 	Model  string `json:"model"`
 	Effort string `json:"effort"`
+	// Idioma overrides the soul's output-language rule: "es" forces Spanish,
+	// "" or "en" leaves the soul's default (English) in charge.
+	Idioma string `json:"idioma,omitempty"`
 }
 
 // Store guards settings.json.
@@ -60,6 +63,14 @@ func (s *Store) SetEffort(e string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.s.Effort = e
+	return s.save()
+}
+
+// SetIdioma persists the language override ("es" or "en").
+func (s *Store) SetIdioma(v string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.s.Idioma = v
 	return s.save()
 }
 
