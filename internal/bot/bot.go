@@ -67,6 +67,7 @@ Commands:
 /ls [path] — list VM files
 /stats — VM + git repo status
 /cancel — stop the current task
+/revivir — Claude login days left per agent; /revivir_zoro · /revivir_sky · /revivir_dominio re-login from the phone (send the link, paste the code)
 /redeploy — rebuild my code + restart (apply changes)
 /update — pull latest code from GitHub + rebuild + restart
 /restart — restart me
@@ -97,6 +98,8 @@ type Bot struct {
 	cancelCur context.CancelFunc
 	lastCost  float64
 	busy      atomic.Bool // true while a turn is being processed
+
+	revive esperaLogin // /revivir: el login que espera el código pegado (revivir.go)
 }
 
 type job struct {
@@ -237,9 +240,21 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 	if text == "" && strings.HasPrefix(strings.TrimSpace(m.Caption), "/") {
 		text = strings.TrimSpace(m.Caption)
 	}
+	// /revivir: el código de login que rafiña pega se queda en Go y NUNCA llega a Claude
+	// (así funciona aunque el login muerto sea el de Zoro). Ver revivir.go.
+	if reCodigoLogin.MatchString(text) && b.revive.vigente() {
+		if ag, ok := b.revive.tomar(); ok {
+			go b.revivirCodigo(m.Chat.ID, ag, text)
+			return
+		}
+	}
 	if strings.HasPrefix(text, "/") {
 		fields := strings.Fields(text)
 		cmd := strings.SplitN(fields[0], "@", 2)[0] // strip @botname
+		if ag, ok := esComandoRevivir(cmd, text, fields); ok {
+			go b.revivir(m.Chat.ID, ag)
+			return
+		}
 		switch cmd {
 		case "/start", "/help":
 			b.send(ctx, m.Chat.ID, helpText)
@@ -1047,6 +1062,7 @@ func (b *Bot) registerCommands(ctx context.Context) {
 		{Command: "percance", Description: "🚨 Emergencia vial: seguro, teléfonos, qué hacer"},
 		{Command: "focus", Description: "Fresh session inside a project: /focus <name|off>"},
 		{Command: "idioma", Description: "Switch idioma: /idioma es|en"},
+		{Command: "revivir", Description: "🔑 Revivir el login de Claude (zoro/sky/dominio) desde el cel"},
 	}
 	if err := b.tg.SetMyCommands(ctx, cmds); err != nil {
 		b.log.Warn("setMyCommands failed", "err", err)
