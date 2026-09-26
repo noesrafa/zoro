@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# /revivir — re-login de Claude DESDE EL CEL para un agente (zoro=rafael, sky, dominio).
+# /revivir — re-login de Claude DESDE EL CEL para un agente (zoro=rafael, sky, tequila; dominio apagado 25-sep).
 # Cada login dura ~30 días; al vencer, el agente muere y sólo revive con un login de navegador
 # (23-sep-2026: Sky murió así). El engine de Zoro llama esto SIN pasar por Claude, así que sirve
 # aunque el muerto sea el propio Zoro.
@@ -8,7 +8,7 @@
 #   revivir.sh estado                   → días que le quedan al login de cada agente
 set -uo pipefail
 
-usuario() { case "$1" in zoro) echo rafael;; sky) echo sky;; dominio) echo dominio;; *) return 1;; esac; }
+usuario() { case "$1" in zoro) echo rafael;; sky) echo sky;; tequila) echo tequila;; dominio) echo dominio;; *) return 1;; esac; }
 comoU() { sudo -n -u "$U" -i "$@"; }          # login shell de ese usuario (su PATH trae su claude)
 pantalla() { comoU tmux capture-pane -t "$S" -p -J 2>/dev/null; }
 esperar() {  # $1=regex  $2=segundos → 0 si apareció
@@ -21,7 +21,7 @@ cola() { pantalla | grep -v '^\s*$' | tail -6 | cut -c1-160; }
 estado() {
   sudo -n python3 - <<'PY'
 import json,time,datetime
-for ag,u in [('zoro','rafael'),('sky','sky'),('dominio','dominio')]:
+for ag,u in [('zoro','rafael'),('sky','sky'),('tequila','tequila')]:
     try:
         o=json.load(open(f'/home/{u}/.claude/.credentials.json')).get('claudeAiOauth',{})
         r=o.get('refreshTokenExpiresAt',0)/1000
@@ -38,7 +38,7 @@ PY
 accion=${1:-estado}
 [ "$accion" = "estado" ] && { estado; exit 0; }
 AG=${2:-}
-U=$(usuario "$AG") || { echo "ERROR agente desconocido: '$AG' (usa zoro, sky o dominio)"; exit 2; }
+U=$(usuario "$AG") || { echo "ERROR agente desconocido: '$AG' (usa zoro, sky o tequila)"; exit 2; }
 S="revivir-$AG"
 
 case "$accion" in

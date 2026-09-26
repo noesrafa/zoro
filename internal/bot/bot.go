@@ -67,7 +67,7 @@ Commands:
 /ls [path] — list VM files
 /stats — VM + git repo status
 /cancel — stop the current task
-/revivir — Claude login days left per agent; /revivir_zoro · /revivir_sky · /revivir_dominio re-login from the phone (send the link, paste the code)
+/revivir — Claude login days left per agent; /revivir_zoro · /revivir_sky · /revivir_tequila re-login from the phone (send the link, paste the code)
 /redeploy — rebuild my code + restart (apply changes)
 /update — pull latest code from GitHub + rebuild + restart
 /restart — restart me
@@ -1062,7 +1062,7 @@ func (b *Bot) registerCommands(ctx context.Context) {
 		{Command: "percance", Description: "🚨 Emergencia vial: seguro, teléfonos, qué hacer"},
 		{Command: "focus", Description: "Fresh session inside a project: /focus <name|off>"},
 		{Command: "idioma", Description: "Switch idioma: /idioma es|en"},
-		{Command: "revivir", Description: "🔑 Revivir el login de Claude (zoro/sky/dominio) desde el cel"},
+		{Command: "revivir", Description: "🔑 Revivir el login de Claude (zoro/sky/tequila) desde el cel"},
 	}
 	if err := b.tg.SetMyCommands(ctx, cmds); err != nil {
 		b.log.Warn("setMyCommands failed", "err", err)

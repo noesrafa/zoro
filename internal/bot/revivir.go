@@ -20,7 +20,7 @@ import (
 
 var reCodigoLogin = regexp.MustCompile(`^[A-Za-z0-9_-]{16,}#[A-Za-z0-9_-]{16,}$`)
 
-var agentesRevivir = map[string]bool{"zoro": true, "sky": true, "dominio": true}
+var agentesRevivir = map[string]bool{"zoro": true, "sky": true, "tequila": true, "dominio": true} // dominio: apagado 25-sep, se deja por si revive
 
 // esperaLogin: el login que espera el código que rafiña va a pegar (uno a la vez).
 type esperaLogin struct {
@@ -78,7 +78,7 @@ func (b *Bot) scriptRevivir(ctx context.Context, d time.Duration, args ...string
 
 func (b *Bot) revivir(chatID int64, ag string) {
 	ctx := context.Background()
-	links := "Para revivir uno toca: /revivir_zoro · /revivir_sky · /revivir_dominio"
+	links := "Para revivir uno toca: /revivir_zoro · /revivir_sky · /revivir_tequila"
 	if ag == "" {
 		b.send(ctx, chatID, "🔑 Logins de Claude (duran ~30 días):\n"+b.scriptRevivir(ctx, 30*time.Second, "estado")+"\n\n"+links)
 		return
