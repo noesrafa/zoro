@@ -146,3 +146,19 @@ func TestSenderNamePrefersOwnerName(t *testing.T) {
 		})
 	}
 }
+
+func TestOtherOwnerTag(t *testing.T) {
+	b := &Bot{cfg: config.Config{OwnerID: 1, OwnerName: "Ángel"}}
+	own := job{msgs: []*tg.Message{{From: &tg.User{ID: 1, FirstName: "Angel"}}}}
+	if got := b.otherOwnerTag(own); got != "" {
+		t.Fatalf("primary owner must not be tagged, got %q", got)
+	}
+	other := job{msgs: []*tg.Message{{From: &tg.User{ID: 2, FirstName: "Rafael"}}}}
+	got := b.otherOwnerTag(other)
+	if !strings.Contains(got, "Rafael") || !strings.Contains(got, "NO Ángel") || strings.HasPrefix(got, "-") {
+		t.Fatalf("second owner must be named and never start with '-', got %q", got)
+	}
+	if b.otherOwnerTag(job{}) != "" {
+		t.Fatal("cron job (no msgs) must not be tagged")
+	}
+}

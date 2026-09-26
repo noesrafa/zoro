@@ -506,9 +506,10 @@ func (b *Bot) process(parent context.Context, j job) {
 
 	// On a NEW session, prime the conversation once with the heavy context.md
 	// (durable background about rafiña). On resumes it's already in history.
-	turnPrompt := prompt
+	tagged := b.otherOwnerTag(j) + prompt
+	turnPrompt := tagged
 	if !st.Created {
-		turnPrompt = b.primeWithContext(prompt)
+		turnPrompt = b.primeWithContext(tagged)
 	}
 	wasNew := !st.Created
 	res, err := b.cd.Run(ctx, st.SessionID, !st.Created, turnPrompt, opts)
@@ -577,7 +578,7 @@ func (b *Bot) process(parent context.Context, j job) {
 			} else {
 				b.send(parent, dest, note)
 			}
-			res, err = b.cd.Run(ctx, st.SessionID, true, b.primeWithContext(prompt), opts)
+			res, err = b.cd.Run(ctx, st.SessionID, true, b.primeWithContext(tagged), opts)
 		}
 	}
 	if err != nil {
@@ -811,6 +812,24 @@ func (b *Bot) finishRollover(ctx context.Context, j job, brief string) {
 	b.log.Info("rollover done", "session", st.SessionID)
 	b.send(ctx, dest, "🌙 Cierre del día — "+b.cfg.AgentName+"\n\n"+brief+
 		"\n\n———\n🧹 Sesión nueva, contexto limpio. Este brief entra en el primer mensaje de mañana.")
+}
+
+// otherOwnerTag names the writer when it is NOT the primary owner. The model only
+// ever sees the raw text, so with several owners it took every message as the
+// primary owner's (25-sep-2026: Tequila greeted rafiña as "Ángel"). Only the model
+// sees the tag — the mirror keeps the clean text and labels the sender itself.
+func (b *Bot) otherOwnerTag(j job) string {
+	for _, m := range j.msgs {
+		if m.From == nil || m.From.ID == b.cfg.OwnerID {
+			continue
+		}
+		n := strings.TrimSpace(m.From.FirstName)
+		if n == "" {
+			n = strings.TrimSpace(m.From.Username)
+		}
+		return "[Este mensaje lo escribe " + n + " (Telegram " + strconv.FormatInt(m.From.ID, 10) + "), NO " + b.cfg.OwnerName + ".]\n"
+	}
+	return ""
 }
 
 // senderName labels a mirrored turn with whoever caused it. Jobs with no source
@@ -1063,6 +1082,15 @@ func (b *Bot) registerCommands(ctx context.Context) {
 		{Command: "focus", Description: "Fresh session inside a project: /focus <name|off>"},
 		{Command: "idioma", Description: "Switch idioma: /idioma es|en"},
 		{Command: "revivir", Description: "🔑 Revivir el login de Claude (zoro/sky/tequila) desde el cel"},
+	}
+	// Sub-agents (sky, tequila…) share this engine but not rafiña's personal
+	// commands: /coche, /percance, /redeploy, /revivir only make sense on Zoro.
+	if b.cfg.AgentName != "zoro" {
+		cmds = []tg.BotCommand{
+			{Command: "newsession", Description: "Empezar una conversación nueva"},
+			{Command: "btw", Description: "Pregunta rápida en paralelo: /btw <pregunta>"},
+			{Command: "tasks", Description: "Ver tareas"},
+		}
 	}
 	if err := b.tg.SetMyCommands(ctx, cmds); err != nil {
 		b.log.Warn("setMyCommands failed", "err", err)
