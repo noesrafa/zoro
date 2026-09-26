@@ -45,6 +45,10 @@ case "$accion" in
   inicio)
     comoU tmux kill-session -t "$S" 2>/dev/null
     sudo -n cp -p "/home/$U/.claude/.credentials.json" "/tmp/credenciales-$U.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null
+    # Agente recién nacido: sin esto `claude` abre la bienvenida (tema, etc.) que el bucle de abajo no
+    # sabe contestar y se rinde a los 45 s (Tequila, 25-sep). Se marca la bienvenida como vista.
+    sudo -n python3 -c "import json,os; p='/home/$U/.claude.json'; d=json.load(open(p)) if os.path.exists(p) else {}; d.setdefault('hasCompletedOnboarding', True); json.dump(d, open(p,'w'), indent=2)" \
+      && sudo -n chown "$U:$U" "/home/$U/.claude.json" && sudo -n chmod 600 "/home/$U/.claude.json"
     comoU tmux new-session -d -s "$S" -x 250 -y 60 claude || { echo "ERROR no pude abrir tmux como $U"; exit 1; }
     # Diálogos de arranque que pueden salir antes del prompt: confiar en la carpeta (el cursor puede
     # estar en "No, exit"), novedades tipo "Flicker-free output… Yes, try it / Not now", etc.
