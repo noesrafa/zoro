@@ -81,13 +81,13 @@ I drop deliverables in my outbox and they arrive here automatically.`
 
 // Bot is the running daemon.
 type Bot struct {
-	cfg    config.Config
-	log    *slog.Logger
-	tg     *tg.Client
-	cd     *claude.Driver
-	store  *session.Store
-	set    *settings.Store
-	tts    tts.Config
+	cfg       config.Config
+	log       *slog.Logger
+	tg        *tg.Client
+	cd        *claude.Driver
+	store     *session.Store
+	set       *settings.Store
+	tts       tts.Config
 	mediaC    media.Config
 	ttsDir    string
 	aliveFile string // state/alive — present while running; removed on clean shutdown
@@ -895,9 +895,9 @@ func (b *Bot) reportFailure(ctx context.Context, j job, prompt, msg string) {
 // rafiña can watch a sub-agent (sky, experienciaXXI) work with his mom/dad: who
 // wrote, what they said, and what the agent answered. Off when unset.
 func (b *Bot) mirror(ctx context.Context, j job, userText, reply string) {
-	id := b.cfg.MirrorChatID
-	if id == 0 || id == j.chatID {
-		return // mirroring off, or the watcher is the one talking
+	targets := b.mirrorTargets(j.chatID)
+	if len(targets) == 0 {
+		return // mirroring off, or the only watcher is the one talking
 	}
 	// A machine-made turn shows its label; only a human's turn shows the text itself.
 	shown := strings.TrimSpace(userText)
@@ -912,7 +912,29 @@ func (b *Bot) mirror(ctx context.Context, j job, userText, reply string) {
 	} else {
 		sb.WriteString("\n\n🤖 (no reply)")
 	}
-	b.send(ctx, id, sb.String())
+	for _, id := range targets {
+		b.send(ctx, id, sb.String())
+	}
+}
+
+// mirrorTargets lists every mirror chat except the one that spoke (it already
+// sees its own turn), without zeros or repeats. With one watcher (sky) that is
+// the old behaviour; with two (tequila: Ángel + rafiña) each sees the other.
+func (b *Bot) mirrorTargets(speaker int64) []int64 {
+	ids := b.cfg.MirrorChatIDs
+	if len(ids) == 0 && b.cfg.MirrorChatID != 0 {
+		ids = []int64{b.cfg.MirrorChatID}
+	}
+	var out []int64
+	seen := map[int64]bool{}
+	for _, id := range ids {
+		if id == 0 || id == speaker || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
 }
 
 // finishRollover closes the day: it saves the brief the agent just wrote and rotates
@@ -1056,10 +1078,7 @@ func (b *Bot) sendOutbox(ctx context.Context, chatID int64, before map[string]ti
 	// Every outbox file also echoes to the mirror (when set): the watcher must
 	// SEE what a sub-agent sends its owner (logos, PDFs, fotos), not just read
 	// the text around it. Pedido por rafiña el 13-sep-2026.
-	dests := []int64{chatID}
-	if id := b.cfg.MirrorChatID; id != 0 && id != chatID {
-		dests = append(dests, id)
-	}
+	dests := append([]int64{chatID}, b.mirrorTargets(chatID)...)
 	for _, f := range media.NewOutboxFiles(b.cfg.OutboxDir, before) {
 		ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(f), "."))
 		switch ext {

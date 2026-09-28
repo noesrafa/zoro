@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -160,5 +161,33 @@ func TestOtherOwnerTag(t *testing.T) {
 	}
 	if b.otherOwnerTag(job{}) != "" {
 		t.Fatal("cron job (no msgs) must not be tagged")
+	}
+}
+
+// 28-sep-2026: Tequila mirrors both ways — rafiña sees Ángel's turns and Ángel
+// sees rafiña's. Each turn goes to every watcher except the one who spoke.
+func TestMirrorTargets(t *testing.T) {
+	const angel, rafa, other = int64(7197485955), int64(7395326131), int64(42)
+	two := &Bot{cfg: config.Config{MirrorChatID: angel, MirrorChatIDs: []int64{angel, rafa, rafa, 0}}}
+	cases := []struct {
+		name    string
+		b       *Bot
+		speaker int64
+		want    []int64
+	}{
+		{"angel speaks → only rafa", two, angel, []int64{rafa}},
+		{"rafa speaks → only angel", two, rafa, []int64{angel}},
+		{"cron/other chat → both, no repeats", two, other, []int64{angel, rafa}},
+		{"single watcher (sky) keeps old behaviour", &Bot{cfg: config.Config{MirrorChatID: rafa}}, other, []int64{rafa}},
+		{"single watcher talking → nobody", &Bot{cfg: config.Config{MirrorChatID: rafa}}, rafa, nil},
+		{"mirroring off", &Bot{}, other, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := c.b.mirrorTargets(c.speaker)
+			if fmt.Sprint(got) != fmt.Sprint(c.want) {
+				t.Errorf("mirrorTargets(%d) = %v, want %v", c.speaker, got, c.want)
+			}
+		})
 	}
 }

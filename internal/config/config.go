@@ -37,8 +37,14 @@ type Config struct {
 	// Mirror: when set, every turn (who wrote + what the agent answered) is echoed
 	// to this chat via this same bot. Used so rafiña can watch the sub-agents
 	// (sky, experienciaXXI) talk to his mom/dad without being in their chats.
-	MirrorChatID int64
-	AgentName    string // label shown in mirrored messages, e.g. "sky"
+	// ZORO_MIRROR_CHAT_ID accepts a comma-separated list (28-sep-2026, Tequila:
+	// rafiña and Ángel each see the other's turns). MirrorChatID is the FIRST one,
+	// the watcher that gets machine messages (cron failures, rollover, lifecycle);
+	// MirrorChatIDs are all of them, and every turn echoes to each one except the
+	// chat that spoke.
+	MirrorChatID  int64
+	MirrorChatIDs []int64
+	AgentName     string // label shown in mirrored messages, e.g. "sky"
 
 	// OwnerName is who the agent is TALKING TO — used to label the priming
 	// prompt. Sub-agents serve someone else (Marilú, Rafa Tena), so hardcoding
@@ -84,33 +90,36 @@ func Load() (Config, error) {
 	loadDotEnv(".env")
 
 	c := Config{
-		Token:        getenv("TELEGRAM_BOT_TOKEN", ""),
-		ClaudeBin:    getenv("CLAUDE_BIN", "/home/rafael/.local/bin/claude"),
-		ClaudeModel:  getenv("CLAUDE_MODEL", "opus"),
-		Effort:       getenv("ZORO_EFFORT", "high"),
-		WorkDir:      getenv("ZORO_WORK_DIR", "/home/rafael"),
-		EngineDir:    getenv("ZORO_ENGINE_DIR", "/home/rafael/zoro"),
-		DangerSkip:   getbool("ZORO_DANGER_SKIP", true),
-		ZoroHome:     getenv("ZORO_HOME", "/home/rafael/.zoro"),
-		StateDir:     getenv("ZORO_STATE_DIR", "/home/rafael/zoro/state"),
-		InboxDir:     getenv("ZORO_INBOX_DIR", "/home/rafael/zoro/inbox"),
-		OutboxDir:    getenv("ZORO_OUTBOX_DIR", "/home/rafael/zoro/outbox"),
-		FFmpegBin:    getenv("FFMPEG_BIN", "ffmpeg"),
-		WhisperBin:   getenv("WHISPER_BIN", ""),
-		WhisperModel: getenv("WHISPER_MODEL", ""),
-		WhisperLang:  getenv("WHISPER_LANG", "es"),
-		PiperBin:     getenv("PIPER_BIN", ""),
-		PiperVoice:   getenv("PIPER_VOICE", ""),
-		MaxFileBytes: getint64("ZORO_MAX_FILE_BYTES", 20*1024*1024),
-		MirrorChatID: getint64("ZORO_MIRROR_CHAT_ID", 0),
-		AgentName:    getenv("ZORO_AGENT_NAME", "zoro"),
-		OwnerName:    getenv("ZORO_OWNER_NAME", "rafiña"),
-		PauseReply:   getenv("ZORO_PAUSE_REPLY", ""),
-		MiMoKeyFile:  getenv("ZORO_MIMO_KEY_FILE", "/home/rafael/.secrets/mimo.key"),
-		MiMoModel:    getenv("ZORO_MIMO_MODEL", "mimo-v2.6-pro"),
-		MiMoBaseURL:  getenv("ZORO_MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/anthropic"),
+		Token:         getenv("TELEGRAM_BOT_TOKEN", ""),
+		ClaudeBin:     getenv("CLAUDE_BIN", "/home/rafael/.local/bin/claude"),
+		ClaudeModel:   getenv("CLAUDE_MODEL", "opus"),
+		Effort:        getenv("ZORO_EFFORT", "high"),
+		WorkDir:       getenv("ZORO_WORK_DIR", "/home/rafael"),
+		EngineDir:     getenv("ZORO_ENGINE_DIR", "/home/rafael/zoro"),
+		DangerSkip:    getbool("ZORO_DANGER_SKIP", true),
+		ZoroHome:      getenv("ZORO_HOME", "/home/rafael/.zoro"),
+		StateDir:      getenv("ZORO_STATE_DIR", "/home/rafael/zoro/state"),
+		InboxDir:      getenv("ZORO_INBOX_DIR", "/home/rafael/zoro/inbox"),
+		OutboxDir:     getenv("ZORO_OUTBOX_DIR", "/home/rafael/zoro/outbox"),
+		FFmpegBin:     getenv("FFMPEG_BIN", "ffmpeg"),
+		WhisperBin:    getenv("WHISPER_BIN", ""),
+		WhisperModel:  getenv("WHISPER_MODEL", ""),
+		WhisperLang:   getenv("WHISPER_LANG", "es"),
+		PiperBin:      getenv("PIPER_BIN", ""),
+		PiperVoice:    getenv("PIPER_VOICE", ""),
+		MaxFileBytes:  getint64("ZORO_MAX_FILE_BYTES", 20*1024*1024),
+		MirrorChatIDs: getint64list("ZORO_MIRROR_CHAT_ID"),
+		AgentName:     getenv("ZORO_AGENT_NAME", "zoro"),
+		OwnerName:     getenv("ZORO_OWNER_NAME", "rafiña"),
+		PauseReply:    getenv("ZORO_PAUSE_REPLY", ""),
+		MiMoKeyFile:   getenv("ZORO_MIMO_KEY_FILE", "/home/rafael/.secrets/mimo.key"),
+		MiMoModel:     getenv("ZORO_MIMO_MODEL", "mimo-v2.6-pro"),
+		MiMoBaseURL:   getenv("ZORO_MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/anthropic"),
 	}
 	c.Agents = parseAgents(getenv("ZORO_AGENTS", ""))
+	if len(c.MirrorChatIDs) > 0 {
+		c.MirrorChatID = c.MirrorChatIDs[0]
+	}
 	c.BriefFile = getenv("ZORO_BRIEF_FILE", filepath.Join(c.StateDir, "brief.md"))
 	c.SoulFile = getenv("ZORO_SOUL_FILE", filepath.Join(c.ZoroHome, "soul.md"))
 	c.ContextFile = getenv("ZORO_CONTEXT_FILE", filepath.Join(c.ZoroHome, "context.md"))
@@ -178,6 +187,17 @@ func getbool(key string, def bool) bool {
 		return false
 	}
 	return def
+}
+
+// getint64list parses a comma-separated list of ids, skipping blanks and junk.
+func getint64list(key string) []int64 {
+	var out []int64
+	for _, f := range strings.Split(os.Getenv(key), ",") {
+		if n, err := strconv.ParseInt(strings.TrimSpace(f), 10, 64); err == nil && n != 0 {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 func getint64(key string, def int64) int64 {
