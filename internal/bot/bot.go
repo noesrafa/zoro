@@ -63,7 +63,10 @@ Commands:
 /coche — car card: plate, tire psi, hologram, gas, VIN
 /percance — roadside emergency card: insurer phones + policy data
 /status — session, model, effort, uptime
-/uso — uso de Claude Code (límites 5h / 7d, snapshot oficial vía claude-hud)
+/uso — uso de Claude Code (límites 5h / 7d, snapshot oficial vía claude-hud) + backend activo
+/stop — pause ALL agents (zoro, sky, tequila): no Claude calls, messages get saved
+/start — un-pause everyone; saved messages get picked up in one turn
+/auth <sub|mimo> — switch backend: Claude subscription or MiMo Token Plan (persists, same session)
 /ls [path] — list VM files
 /stats — VM + git repo status
 /cancel — stop the current task
@@ -100,6 +103,16 @@ type Bot struct {
 	busy      atomic.Bool // true while a turn is being processed
 
 	revive esperaLogin // /revivir: el login que espera el código pegado (revivir.go)
+
+	// run is the Claude call (b.cd.Run); sudo runs `sudo -n …` against the other
+	// agents' dirs. Both are fields only so tests can stand in for them.
+	run  func(ctx context.Context, sessionID string, create bool, prompt string, o claude.RunOpts) (claude.Result, error)
+	sudo func(ctx context.Context, args ...string) ([]byte, error)
+
+	// Pause (pause.go): last canned ack per chat, and whether the resume turn is queued.
+	ackMu        sync.Mutex
+	acked        map[int64]time.Time
+	resumeQueued atomic.Bool
 }
 
 type job struct {
@@ -115,6 +128,8 @@ type job struct {
 	label string
 	// isRollover: close the day, then rotate to a fresh session (see cron.Job.Rollover).
 	isRollover bool
+	// isPending: the resume turn that bundles the messages saved during a pause.
+	isPending bool
 }
 
 // collectWindow is how long the collector waits for more messages before
@@ -135,6 +150,7 @@ func New(cfg config.Config, log *slog.Logger, store *session.Store, set *setting
 			Model:      cfg.ClaudeModel,
 			WorkDir:    cfg.WorkDir,
 			DangerSkip: cfg.DangerSkip,
+			MiMo:       claude.MiMo{KeyFile: cfg.MiMoKeyFile, Model: cfg.MiMoModel, BaseURL: cfg.MiMoBaseURL},
 		}),
 		tts: tts.Config{PiperBin: cfg.PiperBin, PiperVoice: cfg.PiperVoice, FFmpegBin: cfg.FFmpegBin},
 		mediaC: media.Config{
@@ -148,7 +164,9 @@ func New(cfg config.Config, log *slog.Logger, store *session.Store, set *setting
 		startedAt: time.Now(),
 		jobs:      make(chan job, 16),
 		quit:      make(chan struct{}),
+		sudo:      defaultSudo,
 	}
+	b.run = b.cd.Run
 	// Coalesce albums and quick bursts into a single turn (see internal/collector).
 	b.collector = collector.New(collectWindow, func(chatID int64, msgs []*tg.Message) {
 		b.enqueue(job{chatID: chatID, msgs: msgs})
@@ -179,14 +197,27 @@ func (b *Bot) Run(ctx context.Context) error {
 	// Cron scheduler: once a minute, fires due prompts from ~/.zoro/crons.json
 	// (CDMX timezone, hot-reloaded). Each fire enqueues a normal turn.
 	go cron.Run(ctx, b.cfg.CronFile, b.fireCron, b.log)
+	// Pause: resume saved messages once the flag is gone; Zoro also watches the others.
+	go b.pauseLoop(ctx)
 
 	b.log.Info("zoro online",
 		"owner", b.cfg.OwnerID, "workdir", b.cfg.WorkDir, "model", b.cfg.ClaudeModel,
 		"stt", b.mediaC.STT.Available(), "tts", b.tts.Available())
-	if crashed {
-		b.notify("⚠️ zoro revivió — el run anterior se cayó. Ya regresé ⚔️")
-	} else {
-		b.notify("⚡ zoro online ⚔️")
+	pausedNote := ""
+	if b.paused() {
+		pausedNote = "\n⏸️ still paused — no Claude calls until /start"
+	}
+	// The nightly update (deploy/actualizar-agentes.sh) leaves this marker: a planned
+	// restart at 01:40 is not news, so it skips the online/stopping notices once.
+	nightly := filepath.Join(b.cfg.StateDir, "reinicio-nocturno")
+	_, err := os.Stat(nightly)
+	quiet := err == nil
+	_ = os.Remove(nightly)
+	switch {
+	case crashed:
+		b.notify("⚠️ " + b.cfg.AgentName + " revivió — el run anterior se cayó. Ya regresé ⚔️" + pausedNote)
+	case !quiet:
+		b.notify("⚡ " + b.cfg.AgentName + " online ⚔️" + pausedNote)
 	}
 
 	offset := 0
@@ -213,7 +244,9 @@ func (b *Bot) Run(ctx context.Context) error {
 
 	// Graceful shutdown: notify, stop accepting new work, finish queued/in-flight, mark clean.
 	b.log.Info("draining before shutdown")
-	b.notify("💤 zoro deteniéndose… (si es un reinicio, vuelvo en unos segundos)")
+	if _, err := os.Stat(nightly); err != nil {
+		b.notify("💤 " + b.cfg.AgentName + " deteniéndose… (si es un reinicio, vuelvo en unos segundos)")
+	}
 	b.collector.Stop() // stop buffering new input; queued jobs still drain below
 	close(b.quit)
 	<-workerDone
@@ -255,13 +288,28 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 			go b.revivir(m.Chat.ID, ag)
 			return
 		}
+		// /stop, /start and /auth are Zoro's: on a sub-agent /start stays Telegram's
+		// usual "hello" and /stop, /auth go to Claude like any unknown command.
+		if b.isZoro() {
+			switch cmd {
+			case "/stop", "/turnoff", "/pause":
+				go b.stopAll(context.Background(), m.Chat.ID)
+				return
+			case "/start", "/resume":
+				go b.startAll(context.Background(), m.Chat.ID)
+				return
+			case "/auth":
+				b.handleAuth(ctx, m.Chat.ID, strings.ToLower(firstArg(text, fields[0])))
+				return
+			}
+		}
 		switch cmd {
 		case "/start", "/help":
 			b.send(ctx, m.Chat.ID, helpText)
 		case "/status":
 			b.send(ctx, m.Chat.ID, b.statusText())
 		case "/uso", "/usage":
-			b.send(ctx, m.Chat.ID, usoText())
+			b.send(ctx, m.Chat.ID, b.usoHeader()+usoText())
 		case "/tasks":
 			b.send(ctx, m.Chat.ID, tasksText())
 		case "/coche":
@@ -382,7 +430,11 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 				b.send(ctx, m.Chat.ID, "Uso: /btw <pregunta> — consulta rápida en paralelo (no toca tu hilo principal).")
 				return
 			}
-			go b.handleBtw(m.Chat.ID, rest)
+			if b.paused() {
+				b.hold(ctx, b.btwHeld(m, rest))
+				return
+			}
+			go b.handleBtw(m, rest)
 		case "/crons", "/cron":
 			// /crons          → list scheduled messages + next run
 			// /crons <id>     → fire that cron right now (at the moment)
@@ -394,6 +446,10 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 				j, ok := b.findCron(id)
 				if !ok {
 					b.send(ctx, m.Chat.ID, "⚠️ No encontré el cron \""+id+"\". Manda /crons para ver la lista.")
+					return
+				}
+				if b.paused() {
+					b.send(ctx, m.Chat.ID, "⏸️ Paused — crons don't run until /start.")
 					return
 				}
 				b.send(ctx, m.Chat.ID, "🧪 Disparando cron \""+j.ID+"\" ahora…")
@@ -479,8 +535,24 @@ func (b *Bot) process(parent context.Context, j job) {
 	defer stopTyping()
 
 	prompt := j.prompt
+	texts := []string{j.prompt}
+	var transcripts, files []string
+	pendingN := 0 // resume turn: how many saved messages it carries
+	if j.isPending {
+		defer b.resumeQueued.Store(false)
+		if b.paused() {
+			return // paused again before it ran: the queue stays
+		}
+		msgs, _ := readPending(b.pendingFile())
+		if len(msgs) == 0 {
+			return
+		}
+		prompt, pendingN = pendingPrompt(msgs), len(msgs)
+	}
 	if len(j.msgs) > 0 {
-		p, notes, err := b.ingestMessages(ctx, j.msgs)
+		var notes []string
+		var err error
+		texts, transcripts, files, notes, err = b.ingestParts(ctx, j.msgs)
 		if err != nil {
 			b.send(parent, j.chatID, "⚠️ media error: "+err.Error())
 			return
@@ -488,11 +560,30 @@ func (b *Bot) process(parent context.Context, j job) {
 		for _, n := range notes {
 			b.send(parent, j.chatID, n)
 		}
-		prompt = p
+		prompt = buildPrompt(texts, transcripts, files)
 		// Text by default: understanding a voice note does NOT force a voice reply.
 		// Audio replies happen only on explicit request (/voice or the send-audio skill).
 	}
 	if strings.TrimSpace(prompt) == "" {
+		return
+	}
+	if j.wantVoice && len(texts) == 1 {
+		texts[0] = "/voice " + texts[0]
+	}
+	held, isOwner := b.heldMsg(j, texts, transcripts, files)
+
+	// Paused (pause.go): NO Claude call. The owner's message is saved for the
+	// resume turn; crons, /compact and a stale resume turn are simply dropped.
+	if b.paused() {
+		switch {
+		case isOwner:
+			b.hold(parent, held)
+			b.mirror(parent, j, prompt, "⏸️ (paused — saved for later)")
+		case j.isCompact:
+			b.send(parent, j.chatID, "⏸️ Paused — nothing runs until /start.")
+		default:
+			b.log.Info("paused: machine turn dropped", "job", j.label)
+		}
 		return
 	}
 
@@ -502,7 +593,7 @@ func (b *Bot) process(parent context.Context, j job) {
 	st := b.store.Current()
 	// The session's cwd (/focus) rides along on EVERY turn — resuming from a
 	// different dir would fork the transcript.
-	opts := claude.RunOpts{Model: cur.Model, Effort: cur.Effort, SystemPrompt: b.systemPrompt(), WorkDir: st.WorkDir}
+	opts := claude.RunOpts{Model: cur.Model, Effort: cur.Effort, SystemPrompt: b.systemPrompt(), WorkDir: st.WorkDir, Auth: cur.Auth}
 
 	// On a NEW session, prime the conversation once with the heavy context.md
 	// (durable background about rafiña). On resumes it's already in history.
@@ -512,7 +603,7 @@ func (b *Bot) process(parent context.Context, j job) {
 		turnPrompt = b.primeWithContext(tagged)
 	}
 	wasNew := !st.Created
-	res, err := b.cd.Run(ctx, st.SessionID, !st.Created, turnPrompt, opts)
+	res, err := b.run(ctx, st.SessionID, !st.Created, turnPrompt, opts)
 	if err != nil && ctx.Err() != nil {
 		return // cancelled / shutting down
 	}
@@ -524,7 +615,31 @@ func (b *Bot) process(parent context.Context, j job) {
 		b.log.Warn("session id already exists on create, resuming instead", "id", st.SessionID)
 		_ = b.store.MarkCreated()
 		st = b.store.Current()
-		res, err = b.cd.Run(ctx, st.SessionID, false, prompt, opts)
+		res, err = b.run(ctx, st.SessionID, false, prompt, opts)
+	}
+	// The API itself answered with an error (limit, MiMo quota/auth…): the CLI
+	// had already written the turn into the transcript, so the session is intact.
+	// Adopt it as created — never rotate it away (27-sep: the weekly limit burned
+	// 10 sessions in a day through the resume-failed branch below).
+	if err != nil && ctx.Err() == nil && res.APIError != "" && res.SessionID != "" {
+		_ = b.store.Set(res.SessionID, true)
+		st = b.store.Current()
+	}
+	// Subscription limit → pause, save the message, forward nothing raw.
+	if err != nil && ctx.Err() == nil && cur.Auth != claude.AuthMiMo && res.HitLimit() {
+		var h *pendingMsg
+		if isOwner {
+			h = &held
+		}
+		b.onLimit(parent, j, res, h)
+		return
+	}
+	// MiMo failed (quota, key…): one short line, session kept, no auth healing —
+	// the healer only knows the Claude login.
+	if err != nil && ctx.Err() == nil && cur.Auth == claude.AuthMiMo {
+		b.log.Warn("mimo turn failed", "detail", truncate(res.Diagnostic(), 500), "err", truncate(err.Error(), 500))
+		b.reportFailure(parent, j, prompt, mimoFailText(res, err))
+		return
 	}
 	// Login died. The CLI itself ran fine — it just couldn't authenticate — so the
 	// session is INTACT and must not be burned. Falling through to the resume-failed
@@ -550,7 +665,7 @@ func (b *Bot) process(parent context.Context, j job) {
 				retryPrompt = turnPrompt // the prime never landed; resend it
 			}
 			st = b.store.Current()
-			res, err = b.cd.Run(ctx, st.SessionID, false, retryPrompt, opts)
+			res, err = b.run(ctx, st.SessionID, false, retryPrompt, opts)
 			if err == nil {
 				b.log.Warn("claude auth failure — credential healed, turn recovered on retry")
 			}
@@ -564,7 +679,7 @@ func (b *Bot) process(parent context.Context, j job) {
 		b.reportFailure(parent, j, prompt, b.failureText(res, err))
 		return
 	}
-	if err != nil && st.Created {
+	if err != nil && st.Created && res.APIError == "" {
 		// Resume failed. Per rafiña: no silent retry — surface the real error and
 		// tell him the thread was reset, then answer on a fresh session so he
 		// always knows WHY the context is gone.
@@ -578,7 +693,7 @@ func (b *Bot) process(parent context.Context, j job) {
 			} else {
 				b.send(parent, dest, note)
 			}
-			res, err = b.cd.Run(ctx, st.SessionID, true, b.primeWithContext(tagged), opts)
+			res, err = b.run(ctx, st.SessionID, true, b.primeWithContext(tagged), opts)
 		}
 	}
 	if err != nil {
@@ -600,6 +715,11 @@ func (b *Bot) process(parent context.Context, j job) {
 	b.mu.Lock()
 	b.lastCost = res.CostUSD
 	b.mu.Unlock()
+	if pendingN > 0 {
+		if err := b.consumePending(pendingN); err != nil {
+			b.log.Warn("resume: could not clear the saved messages", "err", err)
+		}
+	}
 
 	stopTyping()
 
@@ -1059,6 +1179,7 @@ func (b *Bot) statusText() string {
 		"session: " + sid + " (" + state + ")",
 		"model: " + cur.Model,
 		"effort: " + cur.Effort,
+		b.backendLine(),
 		"workdir: " + b.cfg.WorkDir,
 		"focus: " + foco,
 		fmt.Sprintf("last turn cost: $%.4f", cost),
@@ -1082,6 +1203,9 @@ func (b *Bot) registerCommands(ctx context.Context) {
 		{Command: "focus", Description: "Fresh session inside a project: /focus <name|off>"},
 		{Command: "idioma", Description: "Switch idioma: /idioma es|en"},
 		{Command: "revivir", Description: "🔑 Revivir el login de Claude (zoro/sky/tequila) desde el cel"},
+		{Command: "stop", Description: "⏸️ Pause ALL agents (messages get saved)"},
+		{Command: "start", Description: "▶️ Un-pause all agents, pick up saved messages"},
+		{Command: "auth", Description: "Backend: /auth sub | /auth mimo"},
 	}
 	// Sub-agents (sky, tequila…) share this engine but not rafiña's personal
 	// commands: /coche, /percance, /redeploy, /revivir only make sense on Zoro.
@@ -1097,16 +1221,15 @@ func (b *Bot) registerCommands(ctx context.Context) {
 	}
 }
 
-// ingestMessages downloads every message's attachments and assembles one turn
-// prompt: concatenated texts/captions, then any voice transcripts, then a single
-// line listing all attached files. Notes (skipped files, transcription errors)
-// are returned for the caller to surface to the user.
-func (b *Bot) ingestMessages(ctx context.Context, msgs []*tg.Message) (prompt string, notes []string, err error) {
-	var texts, transcripts, files []string
+// ingestParts downloads every message's attachments and returns the parts of one
+// turn — texts/captions, voice transcripts, attached files — for buildPrompt to
+// assemble (the pause queue keeps them apart). Notes (skipped files,
+// transcription errors) are returned for the caller to surface to the user.
+func (b *Bot) ingestParts(ctx context.Context, msgs []*tg.Message) (texts, transcripts, files, notes []string, err error) {
 	for _, m := range msgs {
 		in, ierr := media.Ingest(ctx, b.mediaC, b.tg, m)
 		if ierr != nil {
-			return "", nil, ierr
+			return nil, nil, nil, nil, ierr
 		}
 		if t := msgText(m); t != "" {
 			texts = append(texts, t)
@@ -1117,7 +1240,7 @@ func (b *Bot) ingestMessages(ctx context.Context, msgs []*tg.Message) (prompt st
 			transcripts = append(transcripts, in.Transcript)
 		}
 	}
-	return buildPrompt(texts, transcripts, files), notes, nil
+	return texts, transcripts, files, notes, nil
 }
 
 // buildPrompt assembles the user-visible turn text from its collected parts.
@@ -1154,11 +1277,17 @@ func firstArg(text, cmdToken string) string {
 	return strings.Fields(rest)[0]
 }
 
-// notify sends a lifecycle message to the owner, out-of-band of any turn.
+// notify sends a lifecycle message out-of-band of any turn. A sub-agent sends it
+// to its watcher (the mirror), not its owner: the nightly update restarts every
+// agent at 01:40, and his mom must not get "online/deteniéndose" every night.
 func (b *Bot) notify(text string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := b.tg.SendMessage(ctx, b.cfg.OwnerID, text, ""); err != nil {
+	dest := b.cfg.OwnerID
+	if b.cfg.MirrorChatID != 0 {
+		dest = b.cfg.MirrorChatID
+	}
+	if err := b.tg.SendMessage(ctx, dest, text, ""); err != nil {
 		b.log.Warn("notify failed", "err", err)
 	}
 }
@@ -1169,15 +1298,27 @@ func (b *Bot) notify(text string) {
 // so there is NO deadline — it runs on context.Background() like the main worker
 // and always delivers, however long it takes. Runs in its own goroutine straight
 // from dispatch — outside the serialized job queue.
-func (b *Bot) handleBtw(chatID int64, question string) {
+func (b *Bot) handleBtw(m *tg.Message, question string) {
+	chatID := m.Chat.ID
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stop := b.typingPump(ctx, chatID, tg.ActionTyping)
 	defer stop()
 
-	opts := claude.RunOpts{Model: "opus", Effort: "medium", SystemPrompt: b.systemPrompt()}
-	res, err := b.cd.Run(ctx, uid.New(), true, question, opts)
+	auth := b.set.Get().Auth
+	opts := claude.RunOpts{Model: "opus", Effort: "medium", SystemPrompt: b.systemPrompt(), Auth: auth}
+	res, err := b.run(ctx, uid.New(), true, question, opts)
 	stop()
+	if err != nil && auth != claude.AuthMiMo && res.HitLimit() {
+		h := b.btwHeld(m, question)
+		b.onLimit(ctx, job{chatID: chatID, msgs: []*tg.Message{m}}, res, &h)
+		return
+	}
+	if err != nil && auth == claude.AuthMiMo {
+		b.log.Warn("mimo btw failed", "detail", truncate(res.Diagnostic(), 500), "err", truncate(err.Error(), 500))
+		b.send(ctx, chatID, "💭 btw → "+mimoFailText(res, err))
+		return
+	}
 	if err != nil {
 		b.send(ctx, chatID, "💭 btw → ⚠️ "+truncate(err.Error(), 800))
 		return
@@ -1189,9 +1330,20 @@ func (b *Bot) handleBtw(chatID int64, question string) {
 	b.reply(ctx, chatID, "💭 *btw* →\n\n"+reply)
 }
 
+// btwHeld is a /btw question saved during a pause.
+func (b *Bot) btwHeld(m *tg.Message, question string) pendingMsg {
+	p, _ := b.heldMsg(job{chatID: m.Chat.ID, msgs: []*tg.Message{m}}, []string{"/btw " + question}, nil, nil)
+	return p
+}
+
 // fireCron enqueues a scheduled job's prompt as a normal turn to the owner. The
 // wrapper tells the model this is an automatic trigger so it replies concisely.
+// While paused it makes no call at all: one log line and the fire is dropped.
 func (b *Bot) fireCron(j cron.Job) {
+	if b.paused() {
+		b.log.Info("cron skipped: paused", "id", j.ID)
+		return
+	}
 	if j.Rollover {
 		// The rollover prompt is an instruction to the agent, not a reminder to the
 		// owner, so it skips the "mándame el resultado como un aviso" framing.

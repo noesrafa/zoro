@@ -60,6 +60,14 @@ func New(token string) *Client {
 	}
 }
 
+// NewAt is New pointed at another API root (tests use an httptest server).
+func NewAt(token, root string) *Client {
+	c := New(token)
+	c.api = root + "/bot" + token
+	c.fileAPI = root + "/file/bot" + token
+	return c
+}
+
 // --- API object model (only the fields we use) ---
 
 type Update struct {

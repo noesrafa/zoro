@@ -1,0 +1,9 @@
+[Unit]
+Description=Nightly agent update + restart, 01:40 CDMX (after the 01:00 close-of-day rollovers)
+
+[Timer]
+OnCalendar=*-*-* 01:40:00 America/Mexico_City
+Persistent=false
+
+[Install]
+WantedBy=timers.target

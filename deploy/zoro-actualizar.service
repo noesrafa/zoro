@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly: update sky/tequila to the latest zoro binary and restart every agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/rafael/zoro/deploy/actualizar-agentes.sh
+# restarts drain in-flight turns (TimeoutStopSec=120 each) + health checks
+TimeoutStartSec=30min

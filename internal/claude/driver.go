@@ -6,9 +6,11 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 )
 
@@ -17,6 +19,19 @@ type Config struct {
 	Model      string
 	WorkDir    string // cmd.Dir — MUST be constant across calls or --resume forks a new session
 	DangerSkip bool
+	MiMo       MiMo // the alternate backend behind /auth mimo
+}
+
+// AuthMiMo is the RunOpts.Auth value that routes a turn to Xiaomi's MiMo Token
+// Plan (Anthropic-compatible endpoint) instead of the Claude subscription.
+const AuthMiMo = "mimo"
+
+// MiMo is where the MiMo backend lives. The key is read from KeyFile on EVERY
+// turn (never cached, never logged) so rotating it needs no restart.
+type MiMo struct {
+	KeyFile string
+	Model   string
+	BaseURL string
 }
 
 // Result is the outcome of one turn.
@@ -28,6 +43,10 @@ type Result struct {
 	IsError   bool
 	Subtype   string
 	Errors    []string // "errors" array of the result event (e.g. resume of a missing session)
+	// APIError is the "error" tag the CLI puts on a synthetic assistant message
+	// when the API call itself failed ("rate_limit", "authentication_failed"…).
+	// A real model reply never carries it.
+	APIError string
 }
 
 // FailureKind classifies WHY a turn failed, read from the CLI's own output.
@@ -67,14 +86,42 @@ func (r Result) Failure() FailureKind {
 		strings.Contains(d, "please run /login"),
 		strings.Contains(d, "authentication_error"):
 		return FailAuth
-	case strings.Contains(d, "usage limit"),
-		strings.Contains(d, "rate limit"),
-		strings.Contains(d, "quota"):
+	case r.HitLimit():
 		return FailLimit
 	case strings.Contains(d, "no conversation found with session id"):
 		return FailNoSession
 	}
 	return FailUnknown
+}
+
+// limitRe is the CLI's own subscription-limit banner, anchored to the start of a
+// line: "You've hit your weekly limit · resets 11pm (America/Mexico_City)" (also
+// session / Opus limits and the monthly spend cap), plus the older
+// "Claude AI usage limit reached|<epoch>".
+var limitRe = regexp.MustCompile(`(?im)^\s*(?:you(?:'|’)ve hit your [^\n·]{0,40}?limit|claude ai usage limit reached)`)
+
+var resetsRe = regexp.MustCompile(`(?i)\bresets\s+([^\n·]+)`)
+
+// HitLimit reports whether the turn died on the Claude subscription's usage limit.
+// It demands BOTH signals: the turn must have failed as an API error (the CLI
+// tags the synthetic message error:"rate_limit" and the result is_error), AND the
+// text must be the CLI's limit banner. A normal reply that merely talks about the
+// weekly limit — even quoting the banner word for word — has neither error flag,
+// so it can never pause the agents.
+func (r Result) HitLimit() bool {
+	if !r.IsError && r.APIError == "" {
+		return false
+	}
+	return limitRe.MatchString(r.Diagnostic())
+}
+
+// LimitResets extracts the "resets …" part of the limit banner ("11pm
+// (America/Mexico_City)"), or "" when the CLI didn't say.
+func (r Result) LimitResets() string {
+	if m := resetsRe.FindStringSubmatch(r.Diagnostic()); m != nil {
+		return strings.TrimSpace(m[1])
+	}
+	return ""
 }
 
 // RunOpts overrides per-turn knobs (model, effort, system prompt).
@@ -83,6 +130,7 @@ type RunOpts struct {
 	Effort       string
 	SystemPrompt string // overrides cfg.SystemPrompt; read fresh each turn for hot-reload
 	WorkDir      string // overrides cfg.WorkDir (/focus) — MUST stay constant within a session
+	Auth         string // "" = Claude subscription (OAuth), AuthMiMo = MiMo Token Plan
 }
 
 type Driver struct{ cfg Config }
@@ -126,16 +174,23 @@ type event struct {
 	IsError      bool            `json:"is_error"`
 	Errors       []string        `json:"errors"`
 	Message      json.RawMessage `json:"message"`
+	// Raw on purpose: only assistant events carry it as a string, and a typed
+	// field would make any other event with an object "error" fail to decode.
+	Error json.RawMessage `json:"error"`
 }
 
 // Run executes one turn and returns the assistant's final text.
 func (d *Driver) Run(ctx context.Context, sessionID string, create bool, prompt string, o RunOpts) (Result, error) {
+	env, err := buildEnv(os.Environ(), o.Auth, d.cfg.MiMo)
+	if err != nil {
+		return Result{SessionID: sessionID}, err
+	}
 	cmd := exec.CommandContext(ctx, d.cfg.Bin, d.args(sessionID, create, prompt, o)...)
 	cmd.Dir = d.cfg.WorkDir
 	if o.WorkDir != "" {
 		cmd.Dir = o.WorkDir
 	}
-	cmd.Env = scrubEnv(os.Environ())
+	cmd.Env = env
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -168,6 +223,10 @@ func (d *Driver) Run(ctx context.Context, sessionID string, create bool, prompt 
 				res.SessionID = ev.SessionID
 			}
 		case "assistant":
+			var tag string
+			if json.Unmarshal(ev.Error, &tag) == nil && tag != "" {
+				res.APIError = tag
+			}
 			// Acumulamos CADA bloque de texto del turno, separando con doble
 			// salto los mensajes distintos (los que van entre tool calls).
 			if t := strings.TrimSpace(extractText(ev.Message)); t != "" {
@@ -231,15 +290,54 @@ func extractText(raw json.RawMessage) string {
 	return b.String()
 }
 
-// scrubEnv removes API-key env vars so the CLI uses its own OAuth (subscription)
-// credentials instead of switching to per-token API billing.
+// backendVars are every env var that can point the CLI at another backend or
+// credential. All of them are stripped from the parent env on every turn, so the
+// subscription mode can never inherit a stray MiMo (or API-key) setting, and the
+// MiMo mode sets exactly its own.
+var backendVars = []string{
+	"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+	"ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+	"ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+}
+
+// scrubEnv removes backend/API-key env vars so the CLI uses its own OAuth
+// (subscription) credentials instead of switching to per-token API billing.
 func scrubEnv(env []string) []string {
 	out := make([]string, 0, len(env))
+next:
 	for _, e := range env {
-		if strings.HasPrefix(e, "ANTHROPIC_API_KEY=") || strings.HasPrefix(e, "ANTHROPIC_AUTH_TOKEN=") {
-			continue
+		for _, k := range backendVars {
+			if strings.HasPrefix(e, k+"=") {
+				continue next
+			}
 		}
 		out = append(out, e)
 	}
 	return out
+}
+
+// buildEnv is the environment of one turn. MiMo mode reads the key file fresh;
+// errors name the file but never contain the key.
+func buildEnv(parent []string, auth string, m MiMo) ([]string, error) {
+	env := scrubEnv(parent)
+	if auth != AuthMiMo {
+		return env, nil
+	}
+	raw, err := os.ReadFile(m.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("mimo key file %s not readable (/auth sub to go back): %w", m.KeyFile, errors.Unwrap(err))
+	}
+	key := strings.TrimSpace(string(raw))
+	if key == "" {
+		return nil, fmt.Errorf("mimo key file %s is empty (/auth sub to go back)", m.KeyFile)
+	}
+	return append(env,
+		"ANTHROPIC_BASE_URL="+m.BaseURL,
+		"ANTHROPIC_AUTH_TOKEN="+key,
+		"ANTHROPIC_MODEL="+m.Model,
+		"ANTHROPIC_DEFAULT_OPUS_MODEL="+m.Model,
+		"ANTHROPIC_DEFAULT_SONNET_MODEL="+m.Model,
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL="+m.Model,
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+	), nil
 }

@@ -16,6 +16,9 @@ type Settings struct {
 	// Idioma overrides the soul's output-language rule: "es" forces Spanish,
 	// "" or "en" leaves the soul's default (English) in charge.
 	Idioma string `json:"idioma,omitempty"`
+	// Auth picks the backend: "" = Claude subscription, "mimo" = MiMo Token Plan.
+	// Switching never rotates the session (cross-resume works both ways).
+	Auth string `json:"auth,omitempty"`
 }
 
 // Store guards settings.json.
@@ -71,6 +74,14 @@ func (s *Store) SetIdioma(v string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.s.Idioma = v
+	return s.save()
+}
+
+// SetAuth persists the backend ("" = subscription, "mimo").
+func (s *Store) SetAuth(v string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.s.Auth = v
 	return s.save()
 }
 

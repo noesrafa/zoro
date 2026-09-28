@@ -59,6 +59,24 @@ type Config struct {
 	PiperVoice string
 
 	MaxFileBytes int64
+
+	// PauseReply is the canned ack an owner gets when writing while the agent is
+	// paused (ZORO_PAUSE_REPLY; empty = say nothing, just save the message).
+	PauseReply string
+	// Agents are the OTHER engines this one pauses/resumes with /stop and /start
+	// (ZORO_AGENTS=sky:/home/sky/engine/state,…). Only Zoro sets it.
+	Agents []Agent
+
+	// MiMo backend for /auth mimo (Xiaomi Token Plan, Anthropic-compatible).
+	MiMoKeyFile string
+	MiMoModel   string
+	MiMoBaseURL string
+}
+
+// Agent is another engine on this VPS: its unix user (== its name) and state dir.
+type Agent struct {
+	Name     string
+	StateDir string
 }
 
 // Load reads configuration, applying defaults. Token and OwnerID are required.
@@ -87,7 +105,12 @@ func Load() (Config, error) {
 		MirrorChatID: getint64("ZORO_MIRROR_CHAT_ID", 0),
 		AgentName:    getenv("ZORO_AGENT_NAME", "zoro"),
 		OwnerName:    getenv("ZORO_OWNER_NAME", "rafiña"),
+		PauseReply:   getenv("ZORO_PAUSE_REPLY", ""),
+		MiMoKeyFile:  getenv("ZORO_MIMO_KEY_FILE", "/home/rafael/.secrets/mimo.key"),
+		MiMoModel:    getenv("ZORO_MIMO_MODEL", "mimo-v2.6-pro"),
+		MiMoBaseURL:  getenv("ZORO_MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/anthropic"),
 	}
+	c.Agents = parseAgents(getenv("ZORO_AGENTS", ""))
 	c.BriefFile = getenv("ZORO_BRIEF_FILE", filepath.Join(c.StateDir, "brief.md"))
 	c.SoulFile = getenv("ZORO_SOUL_FILE", filepath.Join(c.ZoroHome, "soul.md"))
 	c.ContextFile = getenv("ZORO_CONTEXT_FILE", filepath.Join(c.ZoroHome, "context.md"))
@@ -120,6 +143,20 @@ func Load() (Config, error) {
 		return c, errors.New("TELEGRAM_OWNER_ID is required")
 	}
 	return c, nil
+}
+
+// parseAgents reads "name:/state/dir,name2:/dir2". Malformed entries are skipped.
+func parseAgents(v string) []Agent {
+	var out []Agent
+	for _, part := range strings.Split(v, ",") {
+		name, dir, ok := strings.Cut(strings.TrimSpace(part), ":")
+		name, dir = strings.TrimSpace(name), strings.TrimSpace(dir)
+		if !ok || name == "" || !filepath.IsAbs(dir) {
+			continue
+		}
+		out = append(out, Agent{Name: name, StateDir: dir})
+	}
+	return out
 }
 
 func getenv(key, def string) string {

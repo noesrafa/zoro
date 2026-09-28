@@ -23,8 +23,13 @@ func TestResultFailure(t *testing.T) {
 			want: FailNoSession,
 		},
 		{
-			name: "usage limit",
-			res:  Result{Text: "Claude AI usage limit reached|1755100000"},
+			name: "usage limit (old banner)",
+			res:  Result{Text: "Claude AI usage limit reached|1755100000", IsError: true},
+			want: FailLimit,
+		},
+		{
+			name: "weekly limit (verbatim, 27-sep-2026)",
+			res:  Result{Text: "You've hit your weekly limit · resets 11pm (America/Mexico_City)", IsError: true, APIError: "rate_limit"},
 			want: FailLimit,
 		},
 		{
