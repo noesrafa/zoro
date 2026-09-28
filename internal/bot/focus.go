@@ -7,6 +7,9 @@ package bot
 // metadata: it ends with the session (/focus off, /newsession, the nightly
 // rollover) and does NOT survive a restart/redeploy (rafiña's call,
 // 10-sep-2026) — session.Open rotates a focused session away at boot.
+// With /auth, focus belongs to the ACTIVE backend's session only: the other
+// backend's parked session is untouched, and a focused session parked by /auth
+// travels with it (same cwd) but is dropped at restart like any focus.
 
 import (
 	"context"

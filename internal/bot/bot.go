@@ -66,7 +66,7 @@ Commands:
 /uso — uso de Claude Code (límites 5h / 7d, snapshot oficial vía claude-hud) + backend activo
 /stop — pause ALL agents (zoro, sky, tequila): no Claude calls, messages get saved
 /start — un-pause everyone; saved messages get picked up in one turn
-/auth <sub|mimo> — switch backend: Claude subscription or MiMo Token Plan (persists, same session)
+/auth <sub|mimo> — switch backend: Claude subscription or MiMo Token Plan (persists; one session per backend, the other one waits parked)
 /ls [path] — list VM files
 /stats — VM + git repo status
 /cancel — stop the current task
@@ -101,6 +101,10 @@ type Bot struct {
 	cancelCur context.CancelFunc
 	lastCost  float64
 	busy      atomic.Bool // true while a turn is being processed
+	// turnMu is held from the moment a turn reads its backend + session until it
+	// has written the session back, so /auth can never swap sessions under a
+	// running turn (the turn's final store.Set would land on the wrong backend).
+	turnMu sync.Mutex
 
 	revive esperaLogin // /revivir: el login que espera el código pegado (revivir.go)
 
@@ -589,8 +593,21 @@ func (b *Bot) process(parent context.Context, j job) {
 
 	before := media.SnapshotOutbox(b.cfg.OutboxDir)
 
+	b.turnMu.Lock()
+	defer b.turnMu.Unlock()
 	cur := b.set.Get()
-	st := b.store.Current()
+	// One session per backend (/auth): the session a turn runs on ALWAYS belongs
+	// to the backend it runs on. /auth already swapped it; this catches anything
+	// that moved the backend another way (settings.json edited by hand, a crash
+	// between the two writes of /auth), so a subscription transcript can never
+	// be resumed on MiMo — or the other way round — by accident.
+	st, sw, serr := b.store.Use(cur.Auth)
+	if serr != nil {
+		b.log.Warn("session: could not save the backend swap", "err", serr)
+	}
+	if sw.Changed {
+		b.log.Warn("session did not match the backend, swapped", "backend", cur.Auth, "parked", sw.From.SessionID, "now", st.SessionID)
+	}
 	// The session's cwd (/focus) rides along on EVERY turn — resuming from a
 	// different dir would fork the transcript.
 	opts := claude.RunOpts{Model: cur.Model, Effort: cur.Effort, SystemPrompt: b.systemPrompt(), WorkDir: st.WorkDir, Auth: cur.Auth}
@@ -923,7 +940,9 @@ func (b *Bot) finishRollover(ctx context.Context, j job, brief string) {
 		b.send(ctx, dest, "🌙 "+b.cfg.AgentName+": couldn't save the brief ("+err.Error()+") — keeping the current session.")
 		return
 	}
-	st, err := b.store.New()
+	// Rollover also drops the other backend's parked session (/auth): the brief
+	// is the continuity now, and nobody should wake up inside yesterday's thread.
+	st, err := b.store.Rollover()
 	if err != nil {
 		b.log.Warn("rollover: could not rotate session", "err", err)
 		b.send(ctx, dest, "🌙 "+b.cfg.AgentName+": brief saved, but the session did NOT rotate ("+err.Error()+").")
@@ -1179,7 +1198,7 @@ func (b *Bot) statusText() string {
 		"session: " + sid + " (" + state + ")",
 		"model: " + cur.Model,
 		"effort: " + cur.Effort,
-		b.backendLine(),
+		b.backendLine() + b.parkedNote(),
 		"workdir: " + b.cfg.WorkDir,
 		"focus: " + foco,
 		fmt.Sprintf("last turn cost: $%.4f", cost),

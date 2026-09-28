@@ -11,17 +11,15 @@ import (
 	"zoro/internal/settings"
 )
 
-func TestAuthSwitchPersistsAndKeepsTheSession(t *testing.T) {
+func TestAuthSwitchPersists(t *testing.T) {
 	tb := newTestBot(t, "zoro")
 	if err := os.WriteFile(tb.cfg.MiMoKeyFile, []byte("tp-x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_ = tb.store.MarkCreated()
-	sid := tb.store.Current().SessionID
 	ctx := context.Background()
 
 	tb.handleAuth(ctx, 1, "mimo")
-	if tb.sentWith("🔀 Now on MiMo (mimo-v2.6-pro). /auth sub to go back.") != 1 {
+	if tb.sentWith("🔀 MiMo (mimo-v2.6-pro) — sesión nueva en MiMo") != 1 {
 		t.Fatalf("sent %q", tb.sent)
 	}
 	// Persisted like /model: a fresh store (= a restart) still says mimo.
@@ -29,25 +27,19 @@ func TestAuthSwitchPersistsAndKeepsTheSession(t *testing.T) {
 	if again.Get().Auth != claude.AuthMiMo {
 		t.Fatal("/auth mimo must persist in settings.json")
 	}
-	// Next turn goes to MiMo, on the SAME session.
 	var got claude.RunOpts
-	var gotSID string
 	tb.run = func(_ context.Context, s string, _ bool, _ string, o claude.RunOpts) (claude.Result, error) {
-		got, gotSID = o, s
+		got = o
 		return claude.Result{Text: "hi", SessionID: s}, nil
 	}
 	tb.process(ctx, ownerJob("hola"))
-	if got.Auth != claude.AuthMiMo || gotSID != sid {
-		t.Fatalf("turn ran with auth %q on %s, want mimo on %s", got.Auth, gotSID, sid)
+	if got.Auth != claude.AuthMiMo || !strings.Contains(tb.backendLine(), "mimo") {
+		t.Fatalf("turn ran with auth %q, backendLine %q", got.Auth, tb.backendLine())
 	}
-	if !strings.Contains(tb.backendLine(), "mimo") {
-		t.Fatalf("backendLine = %q", tb.backendLine())
-	}
-
 	tb.handleAuth(ctx, 1, "sub")
 	tb.process(ctx, ownerJob("hola"))
-	if got.Auth != "" || gotSID != sid {
-		t.Fatalf("after /auth sub: auth %q on %s", got.Auth, gotSID)
+	if got.Auth != "" {
+		t.Fatalf("after /auth sub: auth %q", got.Auth)
 	}
 }
 
@@ -63,6 +55,7 @@ func TestAuthMiMoRefusesWithoutKey(t *testing.T) {
 func TestMiMoFailureIsOneLineAndKeepsSession(t *testing.T) {
 	tb := newTestBot(t, "zoro")
 	_ = tb.set.SetAuth(claude.AuthMiMo)
+	_, _, _ = tb.store.Use(claude.AuthMiMo)
 	_ = tb.store.MarkCreated()
 	sid := tb.store.Current().SessionID
 	raw := `API Error: 429 {"error":{"type":"rate_limit_error","message":"quota exceeded for tp-SECRET"}}`
