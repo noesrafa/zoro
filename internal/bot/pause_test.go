@@ -337,7 +337,7 @@ func TestStopAndStartFlipEveryFlag(t *testing.T) {
 			t.Fatalf("%s must be removed by /start", p)
 		}
 	}
-	if tb.sentWith("▶️ Back: zoro, sky, tequila — 3 pending message(s) to pick up") != 1 {
+	if tb.sentWith("Back, bro! Zoro, Sky and Tequila are awake again — picking up the 3 message(s)") != 1 {
 		t.Fatalf("start reply, sent %q", tb.sent)
 	}
 	if len(tb.jobs) != 1 {
@@ -345,7 +345,7 @@ func TestStopAndStartFlipEveryFlag(t *testing.T) {
 	}
 
 	tb.startAll(ctx, 1)
-	if tb.sentWith("Nothing was paused") != 1 {
+	if tb.sentWith("Nobody was paused") != 1 {
 		t.Fatalf("second /start must say nothing was paused, sent %q", tb.sent)
 	}
 }
@@ -416,5 +416,68 @@ func TestPauseFlagSurvivesARestart(t *testing.T) {
 	again := &Bot{cfg: tb.cfg}
 	if !again.paused() {
 		t.Fatal("a new engine on the same state dir must still be paused")
+	}
+}
+
+// 28-sep-2026: when the pause ends, whoever was told "I'm paused" (or left a saved
+// message) gets ZORO_RESUME_REPLY ONCE, before the saved messages are answered.
+func TestResumeGreetsWhoNoticedThePauseOnce(t *testing.T) {
+	tb := newTestBot(t, "sky")
+	tb.cfg.PauseReply = "ando en pausa"
+	tb.cfg.ResumeReply = "¡Ya regresé!"
+	pause(t, tb)
+	tb.maybeResume() // a tick during the pause greets nobody
+	tb.process(context.Background(), ownerJob("hola"))
+	if n := tb.sentWith("¡Ya regresé!"); n != 0 {
+		t.Fatalf("no greeting while still paused, got %d", n)
+	}
+	if err := os.Remove(tb.pauseFile()); err != nil { // /start
+		t.Fatal(err)
+	}
+	tb.maybeResume()
+	tb.resumeQueued.Store(false) // the queued turn hasn't run yet: the next tick must not greet again
+	tb.maybeResume()
+	if n := tb.sentWith("¡Ya regresé!"); n != 1 {
+		t.Fatalf("the chat that noticed the pause gets exactly ONE greeting, got %d", n)
+	}
+	if len(tb.jobs) == 0 {
+		t.Fatal("the saved message must still be picked up after the greeting")
+	}
+	// A second pause earns a second greeting.
+	pause(t, tb)
+	tb.maybeResume()
+	tb.process(context.Background(), ownerJob("otra vez"))
+	_ = os.Remove(tb.pauseFile())
+	tb.resumeQueued.Store(false)
+	tb.maybeResume()
+	if n := tb.sentWith("¡Ya regresé!"); n != 2 {
+		t.Fatalf("a new pause greets again, got %d", n)
+	}
+}
+
+func TestResumeWithoutReplyOrWithoutNoticeStaysSilent(t *testing.T) {
+	tb := newTestBot(t, "tequila")
+	tb.cfg.ResumeReply = "de vuelta"
+	pause(t, tb)
+	_ = os.Remove(tb.pauseFile())
+	tb.maybeResume()
+	if len(tb.sent) != 0 {
+		t.Fatalf("nobody noticed the pause: nobody gets greeted, sent %q", tb.sent)
+	}
+	tb2 := newTestBot(t, "sky")
+	pause(t, tb2)
+	tb2.process(context.Background(), ownerJob("hola"))
+	_ = os.Remove(tb2.pauseFile())
+	tb2.maybeResume()
+	if len(tb2.sent) != 0 {
+		t.Fatalf("empty ZORO_RESUME_REPLY must send nothing, sent %q", tb2.sent)
+	}
+}
+
+func TestHumanList(t *testing.T) {
+	for in, want := range map[string]string{"zoro": "Zoro", "zoro,sky": "Zoro and Sky", "zoro,sky,tequila": "Zoro, Sky and Tequila"} {
+		if got := humanList(strings.Split(in, ",")); got != want {
+			t.Errorf("humanList(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

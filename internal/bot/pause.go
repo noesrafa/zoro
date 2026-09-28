@@ -218,6 +218,44 @@ func (b *Bot) ackPaused(ctx context.Context, chatID int64) {
 	b.send(ctx, chatID, b.cfg.PauseReply)
 }
 
+// greetBack (28-sep-2026, pedido de rafiña: "al start debería mandar mensaje que
+// revivió, en plan amigable"): once the pause is over, every chat we told "I'm
+// paused" — or that left a saved message — gets ZORO_RESUME_REPLY ONCE, before the
+// saved messages are answered. Nobody who didn't notice the pause gets pinged.
+func (b *Bot) greetBack(pending []pendingMsg) {
+	b.ackMu.Lock()
+	chats := make([]int64, 0, len(b.acked)+len(pending))
+	seen := map[int64]bool{}
+	for id := range b.acked {
+		if !seen[id] {
+			seen[id] = true
+			chats = append(chats, id)
+		}
+	}
+	for _, m := range pending {
+		if m.ChatID != 0 && !seen[m.ChatID] && !b.greeted[m.ChatID] {
+			seen[m.ChatID] = true
+			chats = append(chats, m.ChatID)
+		}
+	}
+	b.acked = nil
+	if b.greeted == nil {
+		b.greeted = map[int64]bool{}
+	}
+	for _, id := range chats {
+		b.greeted[id] = true // pending lines stay until their turn succeeds: greet once
+	}
+	b.ackMu.Unlock()
+	if b.cfg.ResumeReply == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for _, id := range chats {
+		b.send(ctx, id, b.cfg.ResumeReply)
+	}
+}
+
 // pendingPrompt bundles the queue into one turn.
 func pendingPrompt(msgs []pendingMsg) string {
 	var sb strings.Builder
@@ -328,10 +366,17 @@ func (b *Bot) pauseLoop(ctx context.Context) {
 // maybeResume enqueues the bundle turn once the flag is gone. resumeQueued keeps a
 // slow turn from getting a second copy queued behind it.
 func (b *Bot) maybeResume() {
-	if b.paused() || b.resumeQueued.Load() {
+	if b.paused() {
+		b.ackMu.Lock()
+		b.greeted = nil // a pause is on: whoever notices it gets greeted when it ends
+		b.ackMu.Unlock()
+		return
+	}
+	if b.resumeQueued.Load() {
 		return
 	}
 	msgs, err := readPending(b.pendingFile())
+	b.greetBack(msgs)
 	if err != nil || len(msgs) == 0 {
 		return
 	}
@@ -481,13 +526,13 @@ func (b *Bot) startAll(ctx context.Context, chatID int64) {
 	var msg string
 	switch {
 	case len(back) == 0 && pending == 0:
-		msg = "▶️ Nothing was paused — everyone's already running."
+		msg = "⚔️ We were never down, bro — everyone's already running."
 	case len(back) == 0:
-		msg = fmt.Sprintf("▶️ Nothing was paused — %d saved message(s) still get picked up in the next ~30 s.", pending)
+		msg = fmt.Sprintf("⚔️ Nobody was paused — the %d saved message(s) get picked up in the next ~30 s.", pending)
 	case pending == 0:
-		msg = "▶️ Back: " + strings.Join(back, ", ") + " — nothing pending."
+		msg = "⚔️ Back, bro! " + humanList(back) + " " + areAwake(len(back)) + " — nothing was waiting. Let's keep going."
 	default:
-		msg = fmt.Sprintf("▶️ Back: %s — %d pending message(s) to pick up", strings.Join(back, ", "), pending)
+		msg = fmt.Sprintf("⚔️ Back, bro! %s %s — picking up the %d message(s) that came in meanwhile. Let's keep going.", humanList(back), areAwake(len(back)), pending)
 	}
 	if len(fails) > 0 {
 		msg += "\n⚠️ Couldn't resume: " + strings.Join(fails, "; ")
@@ -495,6 +540,30 @@ func (b *Bot) startAll(ctx context.Context, chatID int64) {
 	b.log.Info("/start", "resumed", back, "pending", pending, "failed", fails)
 	b.send(ctx, chatID, msg)
 	b.maybeResume() // Zoro's own queue goes now; the others' within ~30 s
+}
+
+// humanList turns ["zoro","sky","tequila"] into "Zoro, Sky and Tequila".
+func humanList(names []string) string {
+	c := make([]string, len(names))
+	for i, n := range names {
+		if n != "" {
+			c[i] = strings.ToUpper(n[:1]) + n[1:]
+		}
+	}
+	switch len(c) {
+	case 0:
+		return ""
+	case 1:
+		return c[0]
+	}
+	return strings.Join(c[:len(c)-1], ", ") + " and " + c[len(c)-1]
+}
+
+func areAwake(n int) string {
+	if n == 1 {
+		return "is awake again"
+	}
+	return "are awake again"
 }
 
 // pauseLine is the one-line pause state for /uso and /status ("" when running).

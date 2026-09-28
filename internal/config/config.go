@@ -69,6 +69,9 @@ type Config struct {
 	// PauseReply is the canned ack an owner gets when writing while the agent is
 	// paused (ZORO_PAUSE_REPLY; empty = say nothing, just save the message).
 	PauseReply string
+	// ResumeReply is the friendly "I'm back" each chat that got PauseReply (or left a
+	// saved message) receives once the pause ends (ZORO_RESUME_REPLY; empty = none).
+	ResumeReply string
 	// Agents are the OTHER engines this one pauses/resumes with /stop and /start
 	// (ZORO_AGENTS=sky:/home/sky/engine/state,…). Only Zoro sets it.
 	Agents []Agent
@@ -112,6 +115,7 @@ func Load() (Config, error) {
 		AgentName:     getenv("ZORO_AGENT_NAME", "zoro"),
 		OwnerName:     getenv("ZORO_OWNER_NAME", "rafiña"),
 		PauseReply:    getenv("ZORO_PAUSE_REPLY", ""),
+		ResumeReply:   getenv("ZORO_RESUME_REPLY", ""),
 		MiMoKeyFile:   getenv("ZORO_MIMO_KEY_FILE", "/home/rafael/.secrets/mimo.key"),
 		MiMoModel:     getenv("ZORO_MIMO_MODEL", "mimo-v2.6-pro"),
 		MiMoBaseURL:   getenv("ZORO_MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/anthropic"),

@@ -116,6 +116,7 @@ type Bot struct {
 	// Pause (pause.go): last canned ack per chat, and whether the resume turn is queued.
 	ackMu        sync.Mutex
 	acked        map[int64]time.Time
+	greeted      map[int64]bool // chats already told "I'm back" for the current pause
 	resumeQueued atomic.Bool
 }
 
