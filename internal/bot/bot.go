@@ -113,6 +113,11 @@ type Bot struct {
 	// agents' dirs. Both are fields only so tests can stand in for them.
 	run  func(ctx context.Context, sessionID string, create bool, prompt string, o claude.RunOpts) (claude.Result, error)
 	sudo func(ctx context.Context, args ...string) ([]byte, error)
+	// coach checks the owner's typed English for the gate (gate.go); a field so tests can stand in.
+	coach func(ctx context.Context, text string) (coachVerdict, error)
+	// gatedAt: when the gate last bounced an owner message (one bounce per request).
+	gateMu  sync.Mutex
+	gatedAt time.Time
 
 	// Pause (pause.go): last canned ack per chat, and whether the resume turn is queued.
 	ackMu        sync.Mutex
@@ -173,6 +178,7 @@ func New(cfg config.Config, log *slog.Logger, store *session.Store, set *setting
 		sudo:      defaultSudo,
 	}
 	b.run = b.cd.Run
+	b.coach = b.defaultCoach
 	// Coalesce albums and quick bursts into a single turn (see internal/collector).
 	b.collector = collector.New(collectWindow, func(chatID int64, msgs []*tg.Message) {
 		b.enqueue(job{chatID: chatID, msgs: msgs})

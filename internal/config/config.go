@@ -80,6 +80,12 @@ type Config struct {
 	MiMoKeyFile string
 	MiMoModel   string
 	MiMoBaseURL string
+
+	// English gate grammar coach (gate.go): a fast cloud model (Ollama Cloud,
+	// native /api/chat) that checks the owner's typed English when /gate is on.
+	CoachKeyFile string
+	CoachModel   string
+	CoachURL     string
 }
 
 // Agent is another engine on this VPS: its unix user (== its name) and state dir.
@@ -119,6 +125,9 @@ func Load() (Config, error) {
 		MiMoKeyFile:   getenv("ZORO_MIMO_KEY_FILE", "/home/rafael/.secrets/mimo.key"),
 		MiMoModel:     getenv("ZORO_MIMO_MODEL", "mimo-v2.6-pro"),
 		MiMoBaseURL:   getenv("ZORO_MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/anthropic"),
+		CoachKeyFile:  getenv("ZORO_COACH_KEY_FILE", "/home/rafael/.secrets/ollama-cloud.key"),
+		CoachModel:    getenv("ZORO_COACH_MODEL", "gemma4:31b"),
+		CoachURL:      getenv("ZORO_COACH_URL", "https://ollama.com/api/chat"),
 	}
 	c.Agents = parseAgents(getenv("ZORO_AGENTS", ""))
 	if len(c.MirrorChatIDs) > 0 {
