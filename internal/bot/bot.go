@@ -55,6 +55,7 @@ Commands:
 /model <opus|sonnet|haiku|fable|claude-…> — switch model (persists)
 /effort <low|medium|high|xhigh|max> — set reasoning effort (persists)
 /idioma <es|en> — force Spanish replies, or back to the soul's English default (persists)
+/gate <on|off> — English gate: a Spanish message gets its English version back instead of an answer (start with ! to skip)
 /voice <msg> — reply with a voice note
 /btw <question> — side-question in parallel on Opus (researches freely, won't touch this chat)
 /crons — list scheduled messages (and next run)
@@ -420,6 +421,27 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 			default:
 				b.send(ctx, m.Chat.ID, "⚠️ Usage: /idioma <es|en>")
 			}
+		case "/gate":
+			switch strings.ToLower(firstArg(text, fields[0])) {
+			case "on", "si", "sí", "yes":
+				if err := b.set.SetGate(true); err != nil {
+					b.send(ctx, m.Chat.ID, "⚠️ "+err.Error())
+					return
+				}
+				b.send(ctx, m.Chat.ID, "🇬🇧 English gate ON: if you write in Spanish I'll only send it back in English, so you can say it in English. Start a message with ! to skip it. (/gate off to turn it off)")
+			case "off", "no":
+				if err := b.set.SetGate(false); err != nil {
+					b.send(ctx, m.Chat.ID, "⚠️ "+err.Error())
+					return
+				}
+				b.send(ctx, m.Chat.ID, "✅ English gate OFF")
+			default:
+				state := "off"
+				if b.set.Get().Gate {
+					state = "on"
+				}
+				b.send(ctx, m.Chat.ID, "English gate: "+state+"\nUsage: /gate <on|off>")
+			}
 		case "/voice":
 			rest := strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
 			if rest == "" {
@@ -590,6 +612,15 @@ func (b *Bot) process(parent context.Context, j job) {
 			b.log.Info("paused: machine turn dropped", "job", j.label)
 		}
 		return
+	}
+
+	// English gate (gate.go): a Spanish message from the owner gets its English
+	// version back instead of an answer. Only real owner messages without files;
+	// "!" skips it. Any failure falls through to a normal answer.
+	if isOwner && b.set.Get().Gate && len(j.msgs) > 0 && len(files) == 0 && !gateBypass(texts) {
+		if b.englishGate(ctx, j, texts, transcripts) {
+			return
+		}
 	}
 
 	before := media.SnapshotOutbox(b.cfg.OutboxDir)
@@ -1241,6 +1272,7 @@ func (b *Bot) registerCommands(ctx context.Context) {
 		{Command: "percance", Description: "🚨 Emergencia vial: seguro, teléfonos, qué hacer"},
 		{Command: "focus", Description: "Fresh session inside a project: /focus <name|off>"},
 		{Command: "idioma", Description: "Switch idioma: /idioma es|en"},
+		{Command: "gate", Description: "🇬🇧 English gate: /gate on|off"},
 		{Command: "revivir", Description: "🔑 Revivir el login de Claude (zoro/sky/tequila) desde el cel"},
 		{Command: "stop", Description: "⏸️ Pause ALL agents (messages get saved)"},
 		{Command: "start", Description: "▶️ Un-pause all agents, pick up saved messages"},

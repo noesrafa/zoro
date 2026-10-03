@@ -19,6 +19,9 @@ type Settings struct {
 	// Auth picks the backend: "" = Claude subscription, "mimo" = MiMo Token Plan.
 	// Switching never rotates the session (cross-resume works both ways).
 	Auth string `json:"auth,omitempty"`
+	// Gate turns on the English gate (/gate on): a Spanish message from the owner
+	// gets its English version back instead of an answer. Off by default.
+	Gate bool `json:"gate,omitempty"`
 }
 
 // Store guards settings.json.
@@ -74,6 +77,14 @@ func (s *Store) SetIdioma(v string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.s.Idioma = v
+	return s.save()
+}
+
+// SetGate persists the English gate switch.
+func (s *Store) SetGate(on bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.s.Gate = on
 	return s.save()
 }
 
