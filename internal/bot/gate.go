@@ -31,6 +31,10 @@ import (
 // per request: the message right after a bounce always goes through, so a
 // still-imperfect rewrite never loops.
 //
+// Praise (5-oct-2026, his ask): typed English the coach passes gets a short,
+// specific "well done" before the answer — the rewrite after a bounce too,
+// when it came back clean.
+//
 // Not gated: crons and machine turns, messages with files/photos, very short
 // messages (< 3 words: "dale", "ok"), and anything starting with "!" (escape
 // hatch for urgent or heavy moments). Voice notes and code blocks skip the
@@ -152,16 +156,20 @@ func (b *Bot) grammarGate(ctx context.Context, j job, texts, transcripts []strin
 	if len(transcripts) > 0 || strings.Contains(text, "```") || len(gateWords(text)) < gateMinWords || b.coach == nil {
 		return false
 	}
-	if b.inGrace() {
-		return false
-	}
+	// The rewrite right after a bounce always goes through; it's still checked,
+	// but only so a clean one gets its praise.
+	grace := b.inGrace()
 	v, err := b.coach(ctx, text)
 	if err != nil {
 		b.log.Warn("english gate: coach failed, answering normally", "err", err)
 		return false
 	}
+	if !v.Major {
+		b.praise(ctx, j.chatID, v.Praise)
+		return false
+	}
 	fixed := strings.TrimSpace(v.Corrected)
-	if !v.Major || fixed == "" || fixed == text {
+	if grace || fixed == "" || fixed == text {
 		return false
 	}
 	reply := "🇬🇧 *Almost! Say it like this:*\n\n" + fixed
@@ -179,6 +187,16 @@ func (b *Bot) grammarGate(ctx context.Context, j job, texts, transcripts []strin
 	b.mirror(ctx, j, text, reply)
 	b.markGated()
 	return true
+}
+
+// praise congratulates clean typed English; the coach's line names what he got
+// right, with a plain fallback if it left the line empty.
+func (b *Bot) praise(ctx context.Context, chatID int64, line string) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		line = "Clean English, nothing to fix."
+	}
+	b.reply(ctx, chatID, "🇬🇧 ✅ "+line)
 }
 
 func (b *Bot) markGated() {
@@ -203,6 +221,7 @@ type coachVerdict struct {
 	Major     bool     `json:"major"`
 	Corrected string   `json:"corrected"`
 	Tips      []string `json:"tips"`
+	Praise    string   `json:"praise"`
 }
 
 const coachSystem = `You are an English coach for Rafa, a Mexican developer with B1 English who is practicing by texting his assistant in English.
@@ -214,7 +233,8 @@ NEVER count as major: typos and misspellings, capitalization, punctuation, missi
 If major is true:
 - corrected = his whole message rewritten MINIMALLY: fix only what is needed, keep his words, tone and meaning.
 - tips = 1 to 3 very short lines, one per major error, in simple English, in the form: wrong → right (why).
-If major is false: corrected = "" and tips = [].
+- praise = "".
+If major is false: corrected = "", tips = [] and praise = ONE short line (max 15 words) congratulating him on something specific he did right in THIS message. Prefer his usual weak spots when he got them right: questions with the right auxiliary ("can you…?", "how does it…?", "how's it going?"), its vs it's, verb tenses; otherwise a natural phrase, connector or idiom he used. Warm and casual, like a friend, no emojis, do not repeat his whole message.
 Reply with the JSON object only.`
 
 // coachHTTP is the coach's HTTP client: a slow coach must never hold a turn.

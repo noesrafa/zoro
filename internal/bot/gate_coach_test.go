@@ -42,13 +42,16 @@ func gateBot(t *testing.T, coachErr error) (*testBot, *int) {
 			return coachVerdict{Major: true, Corrected: strings.ReplaceAll(text, "don't will", "won't"),
 				Tips: []string{"don't will → won't (future negative)"}}, nil
 		}
-		return coachVerdict{}, nil
+		if strings.Contains(text, "no praise") {
+			return coachVerdict{}, nil
+		}
+		return coachVerdict{Praise: "Nice question with the auxiliary."}, nil
 	}
 	return tb, &n
 }
 
-// A bad sentence bounces with the fix and NO answer; the rewrite goes through
-// without a second check (one bounce per request).
+// A bad sentence bounces with the fix and NO answer; the rewrite always goes
+// through (one bounce per request) — checked only for praise.
 func TestGrammarGateBounceThenAnswer(t *testing.T) {
 	tb, n := gateBot(t, nil)
 	ctx := context.Background()
@@ -60,12 +63,12 @@ func TestGrammarGateBounceThenAnswer(t *testing.T) {
 		t.Fatalf("bounced message must not reach Claude, calls=%d", tb.nCalls())
 	}
 	tb.process(ctx, ownerJob("I think we don't will use local models either way"))
-	if tb.nCalls() != 1 || *n != 1 {
-		t.Fatalf("the rewrite after a bounce must go straight to Claude: calls=%d coach=%d", tb.nCalls(), *n)
+	if tb.nCalls() != 1 || *n != 2 || tb.sentWith("✅") != 0 {
+		t.Fatalf("a still-wrong rewrite must reach Claude with no praise: calls=%d coach=%d sent=%q", tb.nCalls(), *n, tb.sent)
 	}
-	// The free pass is used up: the next bad sentence is checked again.
+	// The free pass is used up: the next bad sentence is bounced again.
 	tb.process(ctx, ownerJob("and we don't will use the Mac"))
-	if *n != 2 || tb.nCalls() != 1 {
+	if *n != 3 || tb.nCalls() != 1 || tb.sentWith("Almost!") != 2 {
 		t.Fatalf("the grace must be single-use: calls=%d coach=%d", tb.nCalls(), *n)
 	}
 }
@@ -83,11 +86,30 @@ func TestGrammarGatePassThrough(t *testing.T) {
 	if *n != 1 {
 		t.Fatalf("coach must run only on the 1st (short and ! skip it), ran %d", *n)
 	}
+	if tb.sentWith("✅ Nice question with the auxiliary.") != 1 {
+		t.Fatalf("clean English must be praised once, sent=%q", tb.sent)
+	}
 
 	tb2, _ := gateBot(t, errors.New("timeout"))
 	tb2.process(ctx, ownerJob("I think we don't will use local models"))
-	if tb2.nCalls() != 1 || tb2.sentWith("Almost!") != 0 {
-		t.Fatalf("a failing coach must never swallow the message: calls=%d", tb2.nCalls())
+	if tb2.nCalls() != 1 || tb2.sentWith("Almost!") != 0 || tb2.sentWith("✅") != 0 {
+		t.Fatalf("a failing coach must never swallow the message nor praise it: calls=%d sent=%q", tb2.nCalls(), tb2.sent)
+	}
+}
+
+// A clean rewrite after a bounce is praised; a verdict with no line gets the
+// plain fallback.
+func TestGrammarGatePraise(t *testing.T) {
+	tb, _ := gateBot(t, nil)
+	ctx := context.Background()
+	tb.process(ctx, ownerJob("I think we don't will use local models"))
+	tb.process(ctx, ownerJob("I think we won't use local models"))
+	if tb.nCalls() != 1 || tb.sentWith("✅ Nice question") != 1 {
+		t.Fatalf("a clean rewrite must be answered and praised: calls=%d sent=%q", tb.nCalls(), tb.sent)
+	}
+	tb.process(ctx, ownerJob("this one gets no praise line"))
+	if tb.nCalls() != 2 || tb.sentWith("✅ Clean English, nothing to fix.") != 1 {
+		t.Fatalf("an empty praise line must use the fallback: calls=%d sent=%q", tb.nCalls(), tb.sent)
 	}
 }
 
