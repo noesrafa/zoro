@@ -107,6 +107,11 @@ type Bot struct {
 	// running turn (the turn's final store.Set would land on the wrong backend).
 	turnMu sync.Mutex
 
+	// outbox: what the outbox already delivered (outbox.go). Every delivery runs
+	// under turnMu (a turn, or the watcher between turns), which also guards outFails.
+	outbox   *media.Ledger
+	outFails map[string]int // failed sends per file version, to give up after outboxTries
+
 	revive esperaLogin // /revivir: el login que espera el código pegado (revivir.go)
 
 	// run is the Claude call (b.cd.Run); sudo runs `sudo -n …` against the other
@@ -200,6 +205,10 @@ func (b *Bot) Run(ctx context.Context) error {
 	}
 	_ = os.WriteFile(b.aliveFile, []byte(time.Now().UTC().Format(time.RFC3339)), 0o644)
 
+	// Outbox ledger BEFORE the first turn: a first start seeds it with what the
+	// outbox already holds, so old files are not re-sent.
+	b.openOutbox()
+
 	workerDone := make(chan struct{})
 	go func() {
 		b.worker()
@@ -211,6 +220,8 @@ func (b *Bot) Run(ctx context.Context) error {
 	go cron.Run(ctx, b.cfg.CronFile, b.fireCron, b.log)
 	// Pause: resume saved messages once the flag is gone; Zoro also watches the others.
 	go b.pauseLoop(ctx)
+	// Outbox watcher: delivers what detached jobs drop between turns.
+	go b.outboxLoop(ctx)
 
 	b.log.Info("zoro online",
 		"owner", b.cfg.OwnerID, "workdir", b.cfg.WorkDir, "model", b.cfg.ClaudeModel,
@@ -629,8 +640,6 @@ func (b *Bot) process(parent context.Context, j job) {
 		}
 	}
 
-	before := media.SnapshotOutbox(b.cfg.OutboxDir)
-
 	b.turnMu.Lock()
 	defer b.turnMu.Unlock()
 	cur := b.set.Get()
@@ -795,7 +804,7 @@ func (b *Bot) process(parent context.Context, j job) {
 	// not get a 1am message. finishRollover reports to the watcher instead.
 	if j.isRollover {
 		b.finishRollover(parent, j, reply)
-		b.sendOutbox(parent, j.chatID, before)
+		b.sendOutbox(parent, j.chatID, true)
 		return
 	}
 
@@ -804,7 +813,7 @@ func (b *Bot) process(parent context.Context, j job) {
 		if ogg, terr := tts.Synthesize(ctx, b.tts, reply, b.ttsDir); terr == nil {
 			if serr := b.tg.SendVoice(parent, j.chatID, ogg, ""); serr == nil {
 				_ = os.Remove(ogg)
-				b.sendOutbox(parent, j.chatID, before)
+				b.sendOutbox(parent, j.chatID, true)
 				return
 			} else {
 				b.log.Warn("send voice failed", "err", serr)
@@ -818,7 +827,7 @@ func (b *Bot) process(parent context.Context, j job) {
 	if reply != "" {
 		b.reply(parent, j.chatID, reply)
 	}
-	b.sendOutbox(parent, j.chatID, before)
+	b.sendOutbox(parent, j.chatID, true)
 }
 
 // healCredentials kicks the root-owned unit that promotes the newest shared Claude
@@ -1110,53 +1119,6 @@ func readFile(path string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(b))
-}
-
-func (b *Bot) sendOutbox(ctx context.Context, chatID int64, before map[string]time.Time) {
-	// Every outbox file also echoes to the mirror (when set): the watcher must
-	// SEE what a sub-agent sends its owner (logos, PDFs, fotos), not just read
-	// the text around it. Pedido por rafiña el 13-sep-2026.
-	dests := append([]int64{chatID}, b.mirrorTargets(chatID)...)
-	for _, f := range media.NewOutboxFiles(b.cfg.OutboxDir, before) {
-		ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(f), "."))
-		switch ext {
-		case "jpg", "jpeg", "png", "webp", "gif":
-			// Shrink oversized images first, then route by size: Telegram's
-			// sendPhoto silently rejects files over 10 MiB, so anything still
-			// above that goes out as a document (preserved, up to 50 MiB).
-			send := media.OptimizeImage(f)
-			big := false
-			if fi, serr := os.Stat(send); serr == nil && fi.Size() > media.PhotoMaxBytes {
-				big = true
-			}
-			for _, d := range dests {
-				var err error
-				if big {
-					err = b.tg.SendDocument(ctx, d, send, "")
-				} else {
-					err = b.tg.SendPhoto(ctx, d, send, "")
-				}
-				if err != nil {
-					b.log.Warn("send outbox file failed", "file", f, "chat", d, "err", err)
-				}
-			}
-			if send != f {
-				os.Remove(send)
-			}
-		case "ogg", "oga":
-			for _, d := range dests {
-				if err := b.tg.SendVoice(ctx, d, f, ""); err != nil {
-					b.log.Warn("send outbox file failed", "file", f, "chat", d, "err", err)
-				}
-			}
-		default:
-			for _, d := range dests {
-				if err := b.tg.SendDocument(ctx, d, f, ""); err != nil {
-					b.log.Warn("send outbox file failed", "file", f, "chat", d, "err", err)
-				}
-			}
-		}
-	}
 }
 
 func (b *Bot) typingPump(parent context.Context, chatID int64, action string) func() {

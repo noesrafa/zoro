@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -132,49 +131,4 @@ func (c Config) download(ctx context.Context, client *tg.Client, fileID string, 
 		return "", "", err
 	}
 	return dest, "", nil
-}
-
-// SnapshotOutbox records the files currently in dir (name → modtime).
-func SnapshotOutbox(dir string) map[string]time.Time {
-	out := map[string]time.Time{}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return out
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		if info, err := e.Info(); err == nil {
-			out[e.Name()] = info.ModTime()
-		}
-	}
-	return out
-}
-
-// NewOutboxFiles returns absolute paths of files added or modified since before, sorted by name.
-func NewOutboxFiles(dir string, before map[string]time.Time) []string {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil
-	}
-	var names []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		if prev, ok := before[e.Name()]; !ok || info.ModTime().After(prev) {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names)
-	paths := make([]string, 0, len(names))
-	for _, n := range names {
-		paths = append(paths, filepath.Join(dir, n))
-	}
-	return paths
 }
