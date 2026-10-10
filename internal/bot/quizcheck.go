@@ -31,6 +31,10 @@ type quiz struct {
 type quizRule struct {
 	Title string `json:"title"`
 	Text  string `json:"text"`
+	// A tiny example of the mistake and its fix (spanish: a Spanish phrase and
+	// its English). Optional: both or neither; the page shows them as ❌/✅.
+	Bad  string `json:"bad,omitempty"`
+	Good string `json:"good,omitempty"`
 }
 
 // quizPuzzle is one of the three, in this order: reorder, choose, write.
@@ -43,6 +47,8 @@ type quizPuzzle struct {
 	Answer  string   `json:"answer"`
 	Accept  []string `json:"accept,omitempty"` // reorder/write: other right answers
 	Hint    string   `json:"hint,omitempty"`   // shown after 2 misses
+	Es      string   `json:"es,omitempty"`     // what the answer means, in Mexican Spanish (the puzzle's goal)
+	Tip     string   `json:"tip,omitempty"`    // a short nudge shown after the first miss
 }
 
 const (
@@ -51,6 +57,15 @@ const (
 
 	quizMinTiles = 3
 	quizMaxTiles = 14
+
+	// A rule he reads at a glance on the phone (older quizzes had longer ones:
+	// the page shows those too, the validator only judges new ones).
+	quizMaxTitle   = 40
+	quizMaxRule    = 120
+	quizMaxExample = 60
+	quizMaxEs      = 140
+	quizMaxTipWord = 8
+	quizMaxTip     = 60
 )
 
 var quizIDRe = regexp.MustCompile(`^[a-z0-9]{10,40}$`)
@@ -203,8 +218,18 @@ func validateQuiz(q quiz) error {
 	if empty(q.Rule.Title) || empty(q.Rule.Text) {
 		bad("rule.title and rule.text are required")
 	}
-	if len(q.Rule.Title) > 90 || len(q.Rule.Text) > 320 {
-		bad("the rule must be short (title ≤ 90, text ≤ 320 chars)")
+	if n, m := runes(q.Rule.Title), runes(q.Rule.Text); n > quizMaxTitle || m > quizMaxRule {
+		bad("the rule must be short: title ≤ %d chars (got %d), text ≤ %d chars (got %d)", quizMaxTitle, n, quizMaxRule, m)
+	}
+	if empty(q.Rule.Bad) != empty(q.Rule.Good) {
+		bad("rule.bad and rule.good go together (both or neither)")
+	} else if !empty(q.Rule.Bad) {
+		if runes(q.Rule.Bad) > quizMaxExample || runes(q.Rule.Good) > quizMaxExample {
+			bad("rule.bad and rule.good are tiny examples (≤ %d chars each)", quizMaxExample)
+		}
+		if normQuiz(q.Rule.Bad) == normQuiz(q.Rule.Good) {
+			bad("rule.good must fix rule.bad")
+		}
 	}
 	if empty(q.Original) || empty(q.Corrected) {
 		bad("original and corrected are required")
@@ -227,6 +252,7 @@ func validateQuiz(q quiz) error {
 			bad("%s: answer is empty", p.Type)
 			continue
 		}
+		validateExtras(p, bad)
 		switch p.Type {
 		case "reorder":
 			validateReorder(p, bad)
@@ -240,6 +266,29 @@ func validateQuiz(q quiz) error {
 		return errors.New(strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+func runes(s string) int { return len([]rune(strings.TrimSpace(s))) }
+
+// validateExtras checks the optional es and tip: a quiz without them is fine
+// (the page has fallbacks), but when there they must be usable.
+func validateExtras(p quizPuzzle, bad func(string, ...any)) {
+	if es := strings.TrimSpace(p.Es); es != "" {
+		if runes(es) > quizMaxEs {
+			bad("%s: es is too long (≤ %d chars)", p.Type, quizMaxEs)
+		}
+		if normQuiz(es) == normQuiz(p.Answer) {
+			bad("%s: es must be the Spanish meaning, not the English answer", p.Type)
+		}
+	}
+	if tip := strings.TrimSpace(p.Tip); tip != "" {
+		if len(strings.Fields(tip)) > quizMaxTipWord || runes(tip) > quizMaxTip {
+			bad("%s: tip is at most %d words", p.Type, quizMaxTipWord)
+		}
+		if p.Type != "choose" && normQuiz(tip) == normQuiz(p.Answer) {
+			bad("%s: the tip can't be the whole answer", p.Type)
+		}
+	}
 }
 
 func validateReorder(p quizPuzzle, bad func(string, ...any)) {
@@ -359,5 +408,26 @@ func fillReorder(q *quiz) {
 		}
 		p.Accept = acc
 		p.Words = shuffleTiles(quizTiles(p.Answer), append([]string{p.Answer}, p.Accept...))
+	}
+}
+
+// trimExtras drops the optional fields the validator would reject (a long tip,
+// an English "es", half an example): they only add clarity, so they never cost
+// a retry — the page falls back without them.
+func trimExtras(q *quiz) {
+	r := &q.Rule
+	r.Bad, r.Good = strings.TrimSpace(r.Bad), strings.TrimSpace(r.Good)
+	if r.Bad == "" || r.Good == "" || runes(r.Bad) > quizMaxExample || runes(r.Good) > quizMaxExample || normQuiz(r.Bad) == normQuiz(r.Good) {
+		r.Bad, r.Good = "", ""
+	}
+	for i := range q.Puzzles {
+		p := &q.Puzzles[i]
+		p.Es, p.Tip = strings.TrimSpace(p.Es), strings.TrimSpace(p.Tip)
+		if runes(p.Es) > quizMaxEs || (p.Es != "" && normQuiz(p.Es) == normQuiz(p.Answer)) {
+			p.Es = ""
+		}
+		if len(strings.Fields(p.Tip)) > quizMaxTipWord || runes(p.Tip) > quizMaxTip || (p.Type != "choose" && p.Tip != "" && normQuiz(p.Tip) == normQuiz(p.Answer)) {
+			p.Tip = ""
+		}
 	}
 }

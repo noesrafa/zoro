@@ -49,6 +49,50 @@ func TestValidateQuizAcceptsGood(t *testing.T) {
 	}
 }
 
+// withExtras is goodQuiz with the optional fields the page uses for clarity:
+// the rule's ❌/✅ example and each puzzle's Spanish goal and first-miss tip.
+func withExtras() quiz {
+	q := goodQuiz()
+	q.Rule.Bad, q.Rule.Good = "Why Tequila takes long?", "Why does Tequila take long?"
+	q.Puzzles[0].Es, q.Puzzles[0].Tip = "¿Qué tenemos en R2?", "Question word, then do"
+	q.Puzzles[1].Es, q.Puzzles[1].Tip = "¿Por qué Tequila tarda tanto en contestar?", "Tequila = he/she/it"
+	q.Puzzles[2].Es, q.Puzzles[2].Tip = "¿Dónde guarda Ángel las llaves de Meta?", "Ángel = he → does"
+	return q
+}
+
+// The new fields are optional both ways: a quiz without them (every quiz made
+// before 10-oct) is valid, and one with them is valid too.
+func TestValidateQuizExtras(t *testing.T) {
+	if err := validateQuiz(withExtras()); err != nil {
+		t.Fatalf("a quiz with es, tip and the rule example must pass: %v", err)
+	}
+	q := withExtras()
+	q.Puzzles[1].Es, q.Puzzles[2].Tip = "", ""
+	if err := validateQuiz(q); err != nil {
+		t.Fatalf("some extras missing is fine: %v", err)
+	}
+	for name, mutate := range map[string]func(q *quiz){
+		"bad without good":  func(q *quiz) { q.Rule.Good = "" },
+		"good without bad":  func(q *quiz) { q.Rule.Bad = " " },
+		"example not fixed": func(q *quiz) { q.Rule.Good = "why tequila takes long" },
+		"example too long":  func(q *quiz) { q.Rule.Bad = strings.Repeat("why Tequila takes long ", 4) },
+		"title too long":    func(q *quiz) { q.Rule.Title = "Questions: do, does and did go first, always" },
+		"rule too long": func(q *quiz) {
+			q.Rule.Text = "In a question, do/does/did goes before the subject, and the verb stays in its base form: What do we have? Why does it fail?"
+		},
+		"es is english":    func(q *quiz) { q.Puzzles[0].Es = "what do we have in r2" },
+		"es too long":      func(q *quiz) { q.Puzzles[2].Es = strings.Repeat("¿Dónde guarda Ángel las llaves? ", 6) },
+		"tip too long":     func(q *quiz) { q.Puzzles[1].Tip = "Tequila is one person so use the form with s here" },
+		"tip gives it all": func(q *quiz) { q.Puzzles[2].Tip = "Where does Ángel keep the Meta keys?" },
+	} {
+		q := withExtras()
+		mutate(&q)
+		if err := validateQuiz(q); err == nil {
+			t.Errorf("%s: must be rejected", name)
+		}
+	}
+}
+
 func TestValidateQuizRejectsBroken(t *testing.T) {
 	cases := map[string]func(q *quiz){
 		"bad id":             func(q *quiz) { q.ID = "short" },
@@ -151,6 +195,41 @@ func TestBuildQuiz(t *testing.T) {
 	}
 }
 
+// The maker's new fields survive the build and the file the page reads.
+func TestBuildQuizExtras(t *testing.T) {
+	model := strings.NewReplacer(
+		`"text": "In a question, do/does/did goes before the subject."}`, `"text": "In a question, do/does/did goes before the subject.", "bad": "Why Tequila takes long?", "good": "Why does Tequila take long?"}`,
+		`"accept": []},`, `"accept": [], "es": "¿Qué tenemos en R2?", "tip": "Question word, then do"},`,
+		`"hint": "Tequila = he/she/it"}`, `"hint": "Tequila = he/she/it", "es": "¿Por qué Tequila tarda tanto?", "tip": "Tequila = he/she/it"}`,
+	).Replace(modelQuizJSON)
+	q, clean, err := buildQuiz(model, "what we have in r2?")
+	if err != nil || clean {
+		t.Fatalf("model JSON with extras must build: clean=%v err=%v", clean, err)
+	}
+	path := filepath.Join(t.TempDir(), "q", q.ID+".json")
+	if err := writeQuiz(path, q); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(path)
+	for _, want := range []string{`"bad": "Why Tequila takes long?"`, `"es": "¿Qué tenemos en R2?"`, `"tip": "Question word, then do"`, `"es": "¿Por qué Tequila tarda tanto?"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("the quiz file lost %s:\n%s", want, raw)
+		}
+	}
+	if strings.Contains(string(raw), `"es": ""`) || strings.Contains(string(raw), `"tip": ""`) {
+		t.Errorf("absent extras are left out of the file:\n%s", raw)
+	}
+	// Extras the validator would reject are dropped at build time, not retried.
+	long := strings.Replace(model, `"tip": "Question word, then do"`, `"tip": "Start with the question word and then put do"`, 1)
+	long = strings.Replace(long, `"bad": "Why Tequila takes long?", `, ``, 1)
+	if q, _, err := buildQuiz(long, "what we have in r2?"); err != nil || q.Puzzles[0].Tip != "" || q.Puzzles[1].Tip == "" || q.Rule.Good != "" {
+		t.Fatalf("a long tip and half an example go, the quiz stays: err=%v %+v", err, q)
+	}
+	if _, _, err := buildQuiz(modelQuizJSON, "what we have in r2?"); err != nil {
+		t.Fatalf("model JSON without extras still builds: %v", err)
+	}
+}
+
 const checkOK = `{"rule_ok": true, "reorder_other_orders": [], "choose_correct": ["does"], "write_answer_ok": true, "write_bad_accept": [], "note": ""}`
 
 // The real generator: maker + checker. A quiz the validator or the checker
@@ -220,6 +299,21 @@ func TestApplyCheck(t *testing.T) {
 	}
 	if got := q.Puzzles[2].Accept; len(got) != 1 || got[0] != "Where does Angel keep the Meta keys?" {
 		t.Fatalf("wrong accepts go: %q", got)
+	}
+	// A wrong es, tip or example goes; the quiz stands (the page has fallbacks).
+	q = withExtras()
+	c = quizCheck{RuleOK: true, ChooseCorrect: []string{"does"}, WriteOK: true, EsWrong: []int{2, 9}, TipWrong: []int{3}, ExampleWrong: true}
+	if err := applyCheck(&q, c); err != nil {
+		t.Fatalf("wrong extras are dropped, not rejected: %v", err)
+	}
+	if q.Puzzles[1].Es != "" || q.Puzzles[0].Es == "" || q.Puzzles[2].Es == "" {
+		t.Fatalf("only puzzle 2's es goes: %+v", q.Puzzles)
+	}
+	if q.Puzzles[2].Tip != "" || q.Puzzles[0].Tip == "" || q.Rule.Bad != "" || q.Rule.Good != "" {
+		t.Fatalf("puzzle 3's tip and the example go: %+v %+v", q.Rule, q.Puzzles)
+	}
+	if p := quizCheckPrompt(withExtras()); !strings.Contains(p, "es: ¿Qué tenemos en R2?") || !strings.Contains(p, "❌ Why Tequila takes long?") {
+		t.Fatalf("the checker sees the extras:\n%s", p)
 	}
 	for name, c := range map[string]quizCheck{
 		"wrong rule":      {RuleOK: false, ChooseCorrect: []string{"does"}, WriteOK: true},
