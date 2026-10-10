@@ -2,7 +2,7 @@
 # actualizar-agentes.sh — actualización + reinicio nocturno de TODOS los agentes (pedido de rafiña,
 # 28-sep-2026: "cada día, en la limpieza, reinicia a todos y actualízalos para que siempre corran el
 # último Zoro"). Lo corre zoro-actualizar.timer como root a las 01:40 CDMX — después de los cierres
-# del día (cierre-del-dia de zoro y sky, 01:00 ±5 min); tequila no tiene.
+# del día (cierre-del-dia, 01:00 ±5 min; desde 7d31397 lo trae el engine para los tres, tequila incluido).
 #
 #   1. Preflight como rafael: go test ./... en ~/zoro y bin/zoro existe y es ejecutable.
 #      Si algo falla: no copia nada, no reinicia nada, lo anota y despierta a Zoro.
