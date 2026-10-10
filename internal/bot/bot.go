@@ -235,7 +235,7 @@ func (b *Bot) Run(ctx context.Context) error {
 
 	// Cron scheduler: once a minute, fires due prompts from ~/.zoro/crons.json
 	// (CDMX timezone, hot-reloaded). Each fire enqueues a normal turn.
-	go cron.Run(ctx, b.cfg.CronFile, b.fireCron, b.log)
+	go cron.Run(ctx, b.loadCrons, b.fireCron, b.log)
 	// Pause: resume saved messages once the flag is gone; Zoro also watches the others.
 	go b.pauseLoop(ctx)
 	// Outbox watcher: delivers what detached jobs drop between turns.
@@ -1457,7 +1457,7 @@ func (b *Bot) fireCron(j cron.Job) {
 // findCron loads crons.json and returns the entry matching ref, which can be a
 // 1-based list number (e.g. "2") or the slug id (e.g. "gastos-hoy").
 func (b *Bot) findCron(ref string) (cron.Job, bool) {
-	f, err := cron.Load(b.cfg.CronFile)
+	f, err := b.loadCrons()
 	if err != nil {
 		return cron.Job{}, false
 	}
@@ -1478,7 +1478,7 @@ func (b *Bot) findCron(ref string) (cron.Job, bool) {
 // cronList renders the configured crons as a clean, numbered list (Markdown).
 // The number is what /crons <n> fires, so it doubles as a quick-fire index.
 func (b *Bot) cronList() string {
-	f, err := cron.Load(b.cfg.CronFile)
+	f, err := b.loadCrons()
 	if err != nil {
 		return "⚠️ crons.json: " + err.Error()
 	}
@@ -1497,6 +1497,9 @@ func (b *Bot) cronList() string {
 		where := "" // side session is the default (digest.go)
 		if j.Rollover || j.Main {
 			where = "  🏠"
+		}
+		if j.Builtin {
+			where += "  ⚙️ del engine"
 		}
 		fmt.Fprintf(&sb, "\n*%d.* %s  *%s*%s\n", i+1, dot, j.ID, where)
 		fmt.Fprintf(&sb, "🗓 %s", humanWhen(j.Schedule))

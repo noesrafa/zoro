@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"zoro/internal/bot"
 	"zoro/internal/claude"
 	"zoro/internal/config"
 	"zoro/internal/cron"
@@ -39,7 +40,7 @@ func runCron(cfg config.Config, args []string) error {
 }
 
 func cronList(cfg config.Config) error {
-	f, err := cron.Load(cfg.CronFile)
+	f, err := cron.LoadWithNightly(cfg.CronFile, bot.NightlyFor(cfg))
 	if err != nil {
 		return err
 	}
@@ -68,7 +69,7 @@ func cronList(cfg config.Config) error {
 }
 
 func cronFire(cfg config.Config, id string) error {
-	f, err := cron.Load(cfg.CronFile)
+	f, err := cron.LoadWithNightly(cfg.CronFile, bot.NightlyFor(cfg))
 	if err != nil {
 		return err
 	}

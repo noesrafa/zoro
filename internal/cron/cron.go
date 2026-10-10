@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	cronparser "github.com/robfig/cron/v3"
@@ -50,6 +51,64 @@ type Job struct {
 	// what it told the owner reaches the main session as a short digest.
 	// The rollover always runs in the main session.
 	Main bool `json:"main,omitempty"`
+
+	// Builtin marks the engine's own nightly close (see Nightly): it never lives in
+	// crons.json, the scheduler adds it.
+	Builtin bool `json:"-"`
+}
+
+// NightlyID is the built-in close's job id. It keeps the id the old crons.json
+// entries used, so its jitter (drift is salted by uid + id) lands where it did.
+const NightlyID = "cierre-del-dia"
+
+// Nightly is the engine's built-in close-the-day: every agent gets it, no cron
+// entry needed (10-oct-2026: Tequila never got the crons.json entry and ran ONE
+// session for 15 days, re-reading ~486K tokens on every call). The prompt comes
+// from PromptFile, else from a legacy "rollover" entry still in crons.json, else
+// Default. Legacy rollover entries are never fired on their own (no double close).
+type Nightly struct {
+	At         string // local "HH:MM" (default 01:00); "off" disables it and legacy entries run as before
+	PromptFile string // the agent's own close-the-day instructions
+	Default    string // generic instructions when there is no file and no legacy entry
+}
+
+// LoadWithNightly is Load plus the built-in nightly close.
+func LoadWithNightly(path string, n Nightly) (File, error) {
+	f, err := Load(path)
+	if err != nil || n.At == "off" {
+		return f, err
+	}
+	prompt, legacy := "", ""
+	if b, rerr := os.ReadFile(n.PromptFile); rerr == nil {
+		prompt = strings.TrimSpace(string(b))
+	}
+	kept := f.Crons[:0:0]
+	for _, j := range f.Crons {
+		if j.Rollover {
+			if j.Enabled && legacy == "" {
+				legacy = j.Prompt
+			}
+			continue
+		}
+		kept = append(kept, j)
+	}
+	if prompt == "" {
+		prompt = legacy
+	}
+	if prompt == "" {
+		prompt = n.Default
+	}
+	f.Crons = append(kept, Job{ID: NightlyID, Schedule: nightlySchedule(n.At), Prompt: prompt,
+		Enabled: true, Rollover: true, Builtin: true})
+	return f, nil
+}
+
+// nightlySchedule turns "HH:MM" into a daily cron spec; anything else is 01:00.
+func nightlySchedule(at string) string {
+	if t, err := time.Parse("15:04", strings.TrimSpace(at)); err == nil {
+		return fmt.Sprintf("%d %d * * *", t.Minute(), t.Hour())
+	}
+	return "0 1 * * *"
 }
 
 // File is the on-disk shape of crons.json.
@@ -179,10 +238,10 @@ type Logger interface {
 	Warn(msg string, args ...any)
 }
 
-// Run drives the scheduler until ctx is cancelled. Every minute it reloads
-// `path` and calls fire(j) for each enabled, due job. fire must not block (the
-// bot's fireCron just enqueues a job).
-func Run(ctx context.Context, path string, fire func(Job), log Logger) {
+// Run drives the scheduler until ctx is cancelled. Every minute it calls load
+// (crons.json + the built-in nightly, so edits hot-reload) and fire(j) for each
+// enabled, due job. fire must not block (the bot's fireCron just enqueues a job).
+func Run(ctx context.Context, load func() (File, error), fire func(Job), log Logger) {
 	// Align the first tick to the next minute boundary so fires land near :00.
 	now := time.Now()
 	first := now.Truncate(time.Minute).Add(time.Minute)
@@ -196,7 +255,7 @@ func Run(ctx context.Context, path string, fire func(Job), log Logger) {
 			return
 		case tick := <-timer.C:
 			timer.Reset(time.Until(tick.Truncate(time.Minute).Add(time.Minute)))
-			f, err := Load(path)
+			f, err := load()
 			if err != nil {
 				log.Warn("cron: load failed", "err", err)
 				last = tick

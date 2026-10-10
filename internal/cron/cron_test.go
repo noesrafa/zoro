@@ -216,3 +216,93 @@ func TestLoadParsesRolloverFlag(t *testing.T) {
 		t.Error("cierre-del-dia should be flagged as rollover")
 	}
 }
+
+func writeCrons(t *testing.T, body string) string {
+	t.Helper()
+	p := t.TempDir() + "/crons.json"
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func nightlyOf(t *testing.T, f File) []Job {
+	t.Helper()
+	var out []Job
+	for _, j := range f.Crons {
+		if j.Rollover {
+			out = append(out, j)
+		}
+	}
+	return out
+}
+
+// The case that bit us: an agent whose crons.json has no close at all (Tequila,
+// 25-sep → 10-oct) still gets one, daily at 01:00, with the generic prompt.
+func TestLoadWithNightly_AgentWithoutEntryGetsOne(t *testing.T) {
+	p := writeCrons(t, `{"crons":[]}`)
+	f, err := LoadWithNightly(p, Nightly{At: "01:00", PromptFile: p + ".missing", Default: "generic"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := nightlyOf(t, f)
+	if len(n) != 1 || !n[0].Builtin || !n[0].Enabled || n[0].ID != NightlyID {
+		t.Fatalf("want exactly one enabled built-in nightly, got %+v", n)
+	}
+	if n[0].Schedule != "0 1 * * *" || n[0].Prompt != "generic" {
+		t.Errorf("schedule %q prompt %q", n[0].Schedule, n[0].Prompt)
+	}
+	// And a missing crons.json is the same as an empty one.
+	f, _ = LoadWithNightly(p+".nope", Nightly{At: "01:00", Default: "generic"})
+	if len(nightlyOf(t, f)) != 1 {
+		t.Error("missing crons.json must still get the nightly")
+	}
+}
+
+// A legacy "rollover" entry is folded into the built-in: its prompt survives, it
+// never fires on its own (no double close), and the other crons are untouched.
+func TestLoadWithNightly_LegacyEntryIsFoldedNotDoubled(t *testing.T) {
+	p := writeCrons(t, `{"crons":[
+	  {"id":"gastos-hoy","schedule":"0 9 * * *","enabled":true,"prompt":"x"},
+	  {"id":"cierre-del-dia","schedule":"0 1 * * *","enabled":true,"rollover":true,"prompt":"legacy"}]}`)
+	f, err := LoadWithNightly(p, Nightly{At: "01:00", PromptFile: p + ".missing", Default: "generic"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := nightlyOf(t, f)
+	if len(n) != 1 || !n[0].Builtin || n[0].Prompt != "legacy" {
+		t.Fatalf("want one built-in carrying the legacy prompt, got %+v", n)
+	}
+	if len(f.Crons) != 2 || f.Crons[0].ID != "gastos-hoy" || f.Crons[0].Rollover {
+		t.Errorf("ordinary crons must pass through untouched: %+v", f.Crons)
+	}
+}
+
+// The agent's own cierre.md wins over both the legacy entry and the default.
+func TestLoadWithNightly_PromptFileWins(t *testing.T) {
+	p := writeCrons(t, `{"crons":[{"id":"cierre-del-dia","schedule":"0 1 * * *","enabled":true,"rollover":true,"prompt":"legacy"}]}`)
+	pf := p + ".cierre.md"
+	if err := os.WriteFile(pf, []byte("\n  mine  \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := LoadWithNightly(p, Nightly{At: "22:30", PromptFile: pf, Default: "generic"})
+	n := nightlyOf(t, f)
+	if len(n) != 1 || n[0].Prompt != "mine" || n[0].Schedule != "30 22 * * *" {
+		t.Fatalf("got %+v", n)
+	}
+}
+
+// "off" is the only way out: no built-in, legacy entries behave exactly as before;
+// a garbage time falls back to 01:00 instead of silently dropping the close.
+func TestLoadWithNightly_OffAndBadTime(t *testing.T) {
+	p := writeCrons(t, `{"crons":[{"id":"cierre-del-dia","schedule":"0 2 * * *","enabled":true,"rollover":true,"prompt":"legacy"}]}`)
+	f, _ := LoadWithNightly(p, Nightly{At: "off", Default: "generic"})
+	n := nightlyOf(t, f)
+	if len(n) != 1 || n[0].Builtin || n[0].Schedule != "0 2 * * *" {
+		t.Fatalf("off must leave crons.json as is, got %+v", n)
+	}
+	f, _ = LoadWithNightly(writeCrons(t, `{"crons":[]}`), Nightly{At: "1am", Default: "generic"})
+	if n := nightlyOf(t, f); len(n) != 1 || n[0].Schedule != "0 1 * * *" {
+		t.Fatalf("bad time must fall back to 01:00, got %+v", n)
+	}
+}
