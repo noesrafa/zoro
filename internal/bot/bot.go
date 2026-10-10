@@ -326,6 +326,10 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 		fields := strings.Fields(text)
 		cmd := strings.SplitN(fields[0], "@", 2)[0] // strip @botname
 		if ag, ok := esComandoRevivir(cmd, text, fields); ok {
+			if !b.isZoro() { // needs root to open another user's login (10-oct: Rinzler's failed with sudo)
+				b.send(ctx, m.Chat.ID, "🔑 /revivir se hace desde el chat de Zoro: ahí manda /revivir_"+b.cfg.AgentName+".")
+				return
+			}
 			go b.revivir(m.Chat.ID, ag)
 			return
 		}
