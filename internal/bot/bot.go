@@ -1487,7 +1487,11 @@ func (b *Bot) cronList() string {
 		if !j.Enabled {
 			dot = "⚪️"
 		}
-		fmt.Fprintf(&sb, "\n*%d.* %s  *%s*\n", i+1, dot, j.ID)
+		where := "" // side session is the default (digest.go)
+		if j.Rollover || j.Main {
+			where = "  🏠"
+		}
+		fmt.Fprintf(&sb, "\n*%d.* %s  *%s*%s\n", i+1, dot, j.ID, where)
 		fmt.Fprintf(&sb, "🗓 %s", humanWhen(j.Schedule))
 		if runs, rerr := cron.NextRuns(j, loc, 1); rerr == nil && len(runs) > 0 {
 			fmt.Fprintf(&sb, "  ·  próxima: %s", humanNext(runs[0], loc))
@@ -1495,7 +1499,7 @@ func (b *Bot) cronList() string {
 		fmt.Fprintf(&sb, "\n💬 %s\n", truncate(oneLine(j.Prompt), 90))
 	}
 	sb.WriteString("\n──────────────\n")
-	fmt.Fprintf(&sb, "_Dispara uno ya:_ `/crons 1`  _o_  `/crons %s`", f.Crons[0].ID)
+	fmt.Fprintf(&sb, "_Dispara uno ya:_ `/crons 1`  _o_  `/crons %s`\n_🏠 = corre en la sesión principal; los demás, en una sesión aparte (\"main\": true para cambiarlo)_", f.Crons[0].ID)
 	return sb.String()
 }
 
