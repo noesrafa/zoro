@@ -27,7 +27,7 @@ ENGINE=/home/rafael/zoro
 BIN=$ENGINE/bin/zoro
 LOG=$ENGINE/state/actualizar.log
 GO=/usr/local/go/bin/go
-AGENTES="sky tequila"            # unix user == unit == /home/<user>/engine/zoro
+AGENTES="sky tequila rinzler"            # unix user == unit == /home/<user>/engine/zoro
 HOY=$(date +%Y%m%d)
 DESPERTAR=/home/rafael/.zoro/despertar.sh
 

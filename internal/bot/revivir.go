@@ -20,7 +20,7 @@ import (
 
 var reCodigoLogin = regexp.MustCompile(`^[A-Za-z0-9_-]{16,}#[A-Za-z0-9_-]{16,}$`)
 
-var agentesRevivir = map[string]bool{"zoro": true, "sky": true, "tequila": true, "dominio": true} // dominio: apagado 25-sep, se deja por si revive
+var agentesRevivir = map[string]bool{"zoro": true, "sky": true, "tequila": true, "rinzler": true, "dominio": true} // dominio: apagado 25-sep, se deja por si revive
 
 // esperaLogin: el login que espera el código que rafiña va a pegar (uno a la vez).
 type esperaLogin struct {
