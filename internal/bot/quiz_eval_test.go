@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"sort"
@@ -33,9 +34,12 @@ type quizEvalRow struct {
 	Err     string  `json:"err,omitempty"`
 	Calls   int     `json:"calls"`
 	Tokens  []int   `json:"tokens"` // input tokens of each call
+	Out     []int   `json:"out"`    // output tokens of each call
 	Seconds float64 `json:"seconds"`
 	Quiz    *quiz   `json:"quiz,omitempty"`
-	Log     string  `json:"log,omitempty"` // the engine's log lines (rejections)
+	Praise  string  `json:"praise,omitempty"` // clean: the maker's line
+	Sent    string  `json:"sent,omitempty"`   // clean: what cleanPraise lets through
+	Log     string  `json:"log,omitempty"`    // the engine's log lines (rejections)
 }
 
 func TestQuizEval(t *testing.T) {
@@ -65,6 +69,10 @@ func TestQuizEval(t *testing.T) {
 	full := os.Getenv("ZORO_QUIZ_EVAL_FULL") == "1"
 	workers := 3
 	sem := make(chan struct{}, workers)
+	// The praise lines are shared like in the engine: each call is told the
+	// last ones, so the eval sees the same variety rafiña would.
+	var recentMu sync.Mutex
+	var recent []string
 	var wg sync.WaitGroup
 	for i := range rows {
 		wg.Add(1)
@@ -85,6 +93,7 @@ func TestQuizEval(t *testing.T) {
 				mu.Lock()
 				r.Calls++
 				r.Tokens = append(r.Tokens, res.Usage.Input())
+				r.Out = append(r.Out, res.Usage.OutputTokens)
 				mu.Unlock()
 				return res, err
 			}
@@ -95,10 +104,16 @@ func TestQuizEval(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), quizTimeout)
 			defer cancel()
+			recentMu.Lock()
+			last := append([]string(nil), recent...)
+			recentMu.Unlock()
+			tb.updateStreak(func(s *quizStreak) { s.Recent = last })
 			t0 := time.Now()
-			q, ok, err := tb.generateQuiz(ctx, text, looksSpanish(text))
+			q, ok, praise, err := tb.generateQuiz(ctx, text, looksSpanish(text))
 			r.Seconds = time.Since(t0).Seconds()
 			switch {
+			case errors.Is(err, errQuizUnsure):
+				r.Result = "unsure"
 			case err != nil && strings.Contains(err.Error(), "rejected twice"):
 				r.Result, r.Err = "rejected", err.Error()
 			case err != nil:
@@ -106,9 +121,18 @@ func TestQuizEval(t *testing.T) {
 			case ok:
 				r.Result, r.Quiz = "quiz", &q
 			default:
-				r.Result = "clean"
+				r.Result, r.Praise = "clean", praise
+				if !looksSpanish(text) {
+					r.Sent = cleanPraise(praise, text, last)
+					recentMu.Lock()
+					recent = append(recent, r.Sent)
+					if len(recent) > praiseRecent {
+						recent = recent[len(recent)-praiseRecent:]
+					}
+					recentMu.Unlock()
+				}
 			}
-			t.Logf("%-7s %-8s %5.1fs calls=%d tokens=%v  %.70s", r.Label, r.Result, r.Seconds, r.Calls, r.Tokens, r.Text)
+			t.Logf("%-7s %-8s %5.1fs calls=%d tokens=%v out=%v  %.70s  %s", r.Label, r.Result, r.Seconds, r.Calls, r.Tokens, r.Out, r.Text, r.Sent)
 		}(&rows[i])
 	}
 	wg.Wait()

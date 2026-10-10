@@ -120,8 +120,9 @@ type Bot struct {
 	run  func(ctx context.Context, sessionID string, create bool, prompt string, o claude.RunOpts) (claude.Result, error)
 	sudo func(ctx context.Context, args ...string) ([]byte, error)
 	// makeQuiz judges the owner's typed English and makes the quiz (quiz.go):
-	// ok=false with no error = clean English. A field so tests can stand in.
-	makeQuiz func(ctx context.Context, text string, spanish bool) (q quiz, ok bool, err error)
+	// ok=false with no error = clean English, praise its line (quizpraise.go).
+	// A field so tests can stand in.
+	makeQuiz func(ctx context.Context, text string, spanish bool) (q quiz, ok bool, praise string, err error)
 	// English gate, quiz mode (quiz.go): the pending quiz (nil = no wall), loaded
 	// from <state>/quiz.json once; whether messages are held; one quiz made at a
 	// time; whether the release turn is queued; quizWG waits for quizzes in flight.
@@ -133,6 +134,7 @@ type Bot struct {
 	quizReleased atomic.Bool
 	quizRetryAt  atomic.Int64 // unix ns: no new release turn before this (a failed one waits)
 	quizWG       sync.WaitGroup
+	streakMu     sync.Mutex // <state>/quiz-streak.json (quizpraise.go)
 
 	// Pause (pause.go): last canned ack per chat, and whether the resume turn is queued.
 	ackMu        sync.Mutex
@@ -650,7 +652,8 @@ func (b *Bot) process(parent context.Context, j job) {
 
 	// English gate, quiz mode (quiz.go): while a quiz is pending the owner's
 	// message is held for later; otherwise his typed English may get a quiz, made
-	// in parallel — the answer never waits for it. Commands and "!" always pass.
+	// in parallel — the answer waits only for a clean verdict's praise, at most
+	// praiseWait. Commands and "!" always pass.
 	if isOwner && len(j.msgs) > 0 && j.msgs[0].From != nil && j.msgs[0].From.ID == b.cfg.OwnerID &&
 		b.quizOn() && !quizPasses(texts) {
 		if b.quizHold(parent, j, prompt, held) {
@@ -658,9 +661,12 @@ func (b *Bot) process(parent context.Context, j job) {
 		}
 		quizText = quizCandidate(texts)
 	}
+	// A clean verdict's praise goes out before the answer (quizpraise.go).
+	var praise *praiseSlot
 	if quizText != "" {
-		b.startQuiz(j.chatID, quizText)
+		praise = b.startQuiz(j.chatID, quizText)
 	}
+	defer praise.close()
 
 	b.turnMu.Lock()
 	defer b.turnMu.Unlock()
@@ -830,6 +836,7 @@ func (b *Bot) process(parent context.Context, j job) {
 		b.quizRetryAt.Store(0)
 	}
 
+	b.awaitPraise(ctx, praise)
 	stopTyping()
 
 	reply := strings.TrimSpace(res.Text)

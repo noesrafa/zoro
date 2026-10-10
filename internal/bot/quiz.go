@@ -7,9 +7,10 @@ package bot
 //
 //   - A typed owner message (≥ 3 words, no "!", no code) is ALWAYS answered. In
 //     parallel ONE Sonnet call (low effort, subscription) judges its English:
-//     clean → nothing; any grammar, word or word-order mistake → a quiz on the
-//     most important one (strict since 9-oct, "no limits on corrections": only
-//     typos, capitals, punctuation, accents and slang are forgiven); Spanish → a
+//     clean → a short, specific praise before the answer (quizpraise.go); any
+//     grammar, word or word-order mistake → a quiz on the most important one
+//     (strict since 9-oct, "no limits on corrections": only typos, capitals,
+//     punctuation, accents and slang are forgiven); Spanish → a
 //     "Say it in English" quiz (settings gate_spanish_off turns that case off).
 //     Each puzzle carries its goal in Mexican Spanish ("es") and a first-miss
 //     "tip"; the rule is one short line plus a ❌/✅ example. validateQuiz checks it: one retry, then no quiz at all — a
@@ -35,6 +36,7 @@ package bot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -186,19 +188,22 @@ func (b *Bot) quizHold(ctx context.Context, j job, prompt string, held pendingMs
 	return true
 }
 
-// startQuiz judges text in the background — the answer never waits for it. One
-// at a time: nothing starts while a quiz is pending or being made.
-func (b *Bot) startQuiz(chatID int64, text string) {
+// startQuiz judges text in the background. One at a time: nothing starts while
+// a quiz is pending or being made (then nil: no verdict, nothing to wait for).
+// Clean English gets its praise through the slot (quizpraise.go); a mistake
+// breaks the streak, whether its quiz goes out or the checker threw it away.
+func (b *Bot) startQuiz(chatID int64, text string) *praiseSlot {
 	if _, ok := b.pendingQuiz(); ok {
-		return
+		return nil
 	}
 	spanish := looksSpanish(text)
 	if spanish && b.set.Get().GateSpanishOff {
-		return
+		return nil
 	}
 	if !b.quizBusy.CompareAndSwap(false, true) {
-		return
+		return nil
 	}
+	slot := newPraiseSlot()
 	b.quizWG.Add(1)
 	go func() {
 		defer b.quizWG.Done()
@@ -206,20 +211,33 @@ func (b *Bot) startQuiz(chatID int64, text string) {
 		ctx, cancel := context.WithTimeout(context.Background(), quizTimeout)
 		defer cancel()
 		t0 := time.Now()
-		q, ok, err := b.makeQuiz(ctx, text, spanish)
+		q, ok, praise, err := b.makeQuiz(ctx, text, spanish)
 		switch {
+		case errors.Is(err, errQuizRejected):
+			close(slot.done)
+			b.streakBroken()
+			b.log.Warn("quiz: none this time", "err", truncate(err.Error(), 300), "took", time.Since(t0).Round(time.Second))
+			return
 		case err != nil:
+			close(slot.done)
 			b.log.Warn("quiz: none this time", "err", truncate(err.Error(), 300), "took", time.Since(t0).Round(time.Second))
 			return
 		case !ok:
 			b.log.Info("quiz: clean English, no quiz", "took", time.Since(t0).Round(time.Second))
+			if !spanish {
+				b.praiseClean(ctx, chatID, text, praise, slot)
+			}
+			close(slot.done)
 			return
 		}
+		close(slot.done)
+		b.streakBroken()
 		if q.Kind == quizSpanish && b.set.Get().GateSpanishOff {
 			return
 		}
 		b.postQuiz(ctx, chatID, q)
 	}()
+	return slot
 }
 
 // postQuiz publishes a valid quiz and puts the wall up — unless the gate went
@@ -264,9 +282,9 @@ func writeQuiz(path string, q quiz) error {
 // (every option that fits, every other order of the tiles, wrong accepts, a
 // wrong rule) and applyCheck fixes what it can. A quiz the validator or the
 // checker rejects gets ONE retry that is told why; a second rejection = no quiz.
-func (b *Bot) generateQuiz(ctx context.Context, text string, spanish bool) (quiz, bool, error) {
+func (b *Bot) generateQuiz(ctx context.Context, text string, spanish bool) (quiz, bool, string, error) {
 	opts := claude.RunOpts{Model: "sonnet", Effort: "low", SystemPrompt: quizSystem, Auth: b.set.Get().Auth, Bare: true}
-	prompt := quizPrompt(text, spanish)
+	prompt := quizPrompt(text, spanish, b.loadStreak().Recent)
 	var last error
 	for try := 0; try < 2; try++ {
 		p := prompt
@@ -276,23 +294,34 @@ func (b *Bot) generateQuiz(ctx context.Context, text string, spanish bool) (quiz
 		}
 		res, err := b.run(ctx, uid.New(), true, p, opts)
 		if err != nil {
-			return quiz{}, false, err
+			return quiz{}, false, "", err
 		}
-		q, clean, err := buildQuiz(res.Text, text)
+		q, praise, clean, err := buildQuiz(res.Text, text)
+		if err == nil && clean && last != nil {
+			// It saw a mistake first: no quiz, but no praise either.
+			return quiz{}, false, "", errQuizUnsure
+		}
 		if err == nil && clean {
-			return quiz{}, false, nil
+			return quiz{}, false, praise, nil
 		}
 		if err == nil {
 			err = b.checkQuiz(ctx, &q)
 		}
 		if err == nil {
-			return q, true, nil
+			return q, true, "", nil
 		}
 		b.log.Info("quiz: rejected", "try", try+1, "why", truncate(err.Error(), 300))
 		last = err
 	}
-	return quiz{}, false, fmt.Errorf("rejected twice: %w", last)
+	return quiz{}, false, "", fmt.Errorf("%w: %w", errQuizRejected, last)
 }
+
+var (
+	// errQuizRejected: the maker saw a mistake but its quiz was rejected twice.
+	errQuizRejected = errors.New("rejected twice")
+	// errQuizUnsure: the maker saw a mistake, then called it clean on the retry.
+	errQuizUnsure = errors.New("clean only on the retry")
+)
 
 // quizCheck is the checker's reading of a quiz.
 type quizCheck struct {
@@ -416,29 +445,34 @@ const quizCheckSystem = `You check a short English quiz for a B1 learner before 
 - example_wrong: true only if the rule example's ❌ part does not show the mistake the rule is about, or its ✅ part is not correct English.
 - note: one short line on what is wrong, or "".`
 
-// buildQuiz turns the model's answer into a checked quiz (clean=true: no quiz).
-func buildQuiz(content, source string) (q quiz, clean bool, err error) {
+// buildQuiz turns the model's answer into a checked quiz (clean=true: no quiz,
+// praise is the maker's line for it).
+func buildQuiz(content, source string) (q quiz, praise string, clean bool, err error) {
 	v, err := parseQuizVerdict(content)
 	if err != nil {
-		return quiz{}, false, err
+		return quiz{}, "", false, err
 	}
 	if v.Clean {
-		return quiz{}, true, nil
+		return quiz{}, v.Praise, true, nil
 	}
 	q = v.quiz
 	q.ID, q.Created, q.Source = newQuizID(), time.Now().UTC().Format(time.RFC3339), source
 	fillReorder(&q)
 	trimExtras(&q)
 	if err := validateQuiz(q); err != nil {
-		return quiz{}, false, err
+		return quiz{}, "", false, err
 	}
-	return q, false, nil
+	return q, "", false, nil
 }
 
-func quizPrompt(text string, spanish bool) string {
+// quizPrompt: his message, and the last praise lines so a clean one gets a new one.
+func quizPrompt(text string, spanish bool, recent []string) string {
 	s := "Rafa's message:\n<<<\n" + text + "\n>>>"
 	if spanish {
 		s += "\n(It looks like Spanish.)"
+	}
+	if len(recent) > 0 {
+		s += "\n\nYour last praise lines (if it is clean, use another emoji and another way of saying it):\n- " + strings.Join(recent, "\n- ")
 	}
 	return s
 }
@@ -576,6 +610,7 @@ func (b *Bot) gateText() string {
 	if msgs, _ := readPending(b.quizHeldFile()); len(msgs) > 0 {
 		s += fmt.Sprintf("\n📥 %d message(s) waiting for it", len(msgs))
 	}
+	s += "\n" + b.streakText()
 	return s + "\nUsage: /gate on|off · /gate spanish on|off"
 }
 
@@ -596,8 +631,14 @@ STEP 1 — decide. He wants EVERY real mistake corrected ("no limits on correcti
   9. A wrong word or form: "more cheap" → "cheaper", "do a question" → "ask a question", double negatives ("I don't like nothing" → "I don't like anything").
 - Forgive ONLY these: typos and misspellings (analize, cuota, englihs, downoload), capital letters, punctuation and commas, missing apostrophes (dont, its, cant), accents, a missing question mark, informal texting and slang (u, pls, bro, man, haha, lol, gonna, wanna, "ok cool"), his tools, screens and environments named without "the" (in preview, to stg, on prod), short chat replies that are complete for a chat ("thanks, send me the ref", "yes do it"), imperatives, brand/product/tech names, numbers, Spanish names of people, places or things.
 - Never "fix" what is already correct: if a native speaker could write his words exactly like that ("It's too much text"), it is not a mistake — a nicer or more natural way to say it doesn't count.
-- {"clean": true} ONLY when nothing but those is off. A message can be long and still clean.
+- Clean ONLY when nothing but those is off. A message can be long and still clean.
 Decide BEFORE you write: write exactly ONE JSON object, once, and never a second one after it.
+
+If clean, reply {"clean": true, "praise": "..."}. praise = ONE short line that congratulates him, in simple English, at most 12 words besides the quote, starting with ONE emoji (never 🔥 or 🧩, the streak and the quiz use them; no other emoji):
+- Quote 2-6 of his exact words in double quotes, then say in a few words what is right about them. Best: a thing from the list above that he got right (a question with do/can/is first, to + verb, a subject he didn't skip, the right preposition or article, a plural, a word Spanish speakers mix up). The style, never copy these: ✅ "Why didn't you send…" — did before you. Perfect. / 🎯 "a bigger logo": adjective first. Nice. / 💪 "want to deploy" — to + verb, spot on.
+- Double quotes ONLY around his exact words, copied as he wrote them (you may cut the end with …); pick a piece without typos. Never quote a word he didn't write.
+- Only praise what is really correct and really in his message. If nothing specific stands out, a short general line ("👌 Clear and correct, nothing to fix.").
+- Vary it: another emoji, another shape and other words than your last lines (not "perfect question" every time).
 
 STEP 2 — only if not clean, the quiz. Simple English a B1 learner reads in 5 seconds on a phone:
 {"clean": false,
@@ -667,7 +708,7 @@ func (b *Bot) handleGate(ctx context.Context, chatID int64, fields []string) {
 			b.send(ctx, chatID, "⚠️ "+err.Error())
 			return
 		}
-		b.send(ctx, chatID, "🇬🇧 English gate ON (quiz mode): I always answer, but when your English has a mistake — or you write in Spanish — I send you a quick quiz (3 puzzles), and my next answer waits until you solve it. Start a message with ! to skip. /gate off to turn it off.")
+		b.send(ctx, chatID, "🇬🇧 English gate ON (quiz mode): I always answer. Clean English gets a quick ✅ first (and a 🔥 streak); when your English has a mistake — or you write in Spanish — I send you a quick quiz (3 puzzles), and my next answer waits until you solve it. Start a message with ! to skip. /gate off to turn it off.")
 	default:
 		n, err := b.gateOff()
 		if err != nil {

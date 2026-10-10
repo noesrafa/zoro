@@ -177,20 +177,21 @@ const modelQuizJSON = "```json\n" + `{"clean": false, "kind": "grammar",
  ]}` + "\n```"
 
 func TestBuildQuiz(t *testing.T) {
-	q, clean, err := buildQuiz(modelQuizJSON, "what we have in r2?")
+	q, _, clean, err := buildQuiz(modelQuizJSON, "what we have in r2?")
 	if err != nil || clean {
 		t.Fatalf("fenced model JSON must build: clean=%v err=%v", clean, err)
 	}
 	if !quizIDRe.MatchString(q.ID) || q.Source != "what we have in r2?" || len(q.Puzzles[0].Words) != 6 {
 		t.Fatalf("engine fields not filled: %+v", q)
 	}
-	if _, clean, err = buildQuiz(`{"clean": true}`, "x"); err != nil || !clean {
-		t.Fatalf("clean verdict: clean=%v err=%v", clean, err)
+	praise := ""
+	if _, praise, clean, err = buildQuiz(`{"clean": true, "praise": "✅ \"did you send\" — did first."}`, "x"); err != nil || !clean || praise != `✅ "did you send" — did first.` {
+		t.Fatalf("clean verdict and its praise: clean=%v praise=%q err=%v", clean, praise, err)
 	}
-	if _, clean, err = buildQuiz("{\"clean\": true}\n\nWait, actually: "+modelQuizJSON, "x"); err != nil || !clean {
+	if _, _, clean, err = buildQuiz("{\"clean\": true}\n\nWait, actually: "+modelQuizJSON, "x"); err != nil || !clean {
 		t.Fatalf("the first verdict stands when the model second-guesses itself: clean=%v err=%v", clean, err)
 	}
-	if _, _, err = buildQuiz("sorry, I can't", "x"); err == nil {
+	if _, _, _, err = buildQuiz("sorry, I can't", "x"); err == nil {
 		t.Fatal("garbage must fail")
 	}
 }
@@ -202,7 +203,7 @@ func TestBuildQuizExtras(t *testing.T) {
 		`"accept": []},`, `"accept": [], "es": "¿Qué tenemos en R2?", "tip": "Question word, then do"},`,
 		`"hint": "Tequila = he/she/it"}`, `"hint": "Tequila = he/she/it", "es": "¿Por qué Tequila tarda tanto?", "tip": "Tequila = he/she/it"}`,
 	).Replace(modelQuizJSON)
-	q, clean, err := buildQuiz(model, "what we have in r2?")
+	q, _, clean, err := buildQuiz(model, "what we have in r2?")
 	if err != nil || clean {
 		t.Fatalf("model JSON with extras must build: clean=%v err=%v", clean, err)
 	}
@@ -222,10 +223,10 @@ func TestBuildQuizExtras(t *testing.T) {
 	// Extras the validator would reject are dropped at build time, not retried.
 	long := strings.Replace(model, `"tip": "Question word, then do"`, `"tip": "Start with the question word and then put do"`, 1)
 	long = strings.Replace(long, `"bad": "Why Tequila takes long?", `, ``, 1)
-	if q, _, err := buildQuiz(long, "what we have in r2?"); err != nil || q.Puzzles[0].Tip != "" || q.Puzzles[1].Tip == "" || q.Rule.Good != "" {
+	if q, _, _, err := buildQuiz(long, "what we have in r2?"); err != nil || q.Puzzles[0].Tip != "" || q.Puzzles[1].Tip == "" || q.Rule.Good != "" {
 		t.Fatalf("a long tip and half an example go, the quiz stays: err=%v %+v", err, q)
 	}
-	if _, _, err := buildQuiz(modelQuizJSON, "what we have in r2?"); err != nil {
+	if _, _, _, err := buildQuiz(modelQuizJSON, "what we have in r2?"); err != nil {
 		t.Fatalf("model JSON without extras still builds: %v", err)
 	}
 }
@@ -253,7 +254,11 @@ func TestGenerateQuizRetry(t *testing.T) {
 		return claude.Result{Text: a}, nil
 	}
 	ctx := context.Background()
-	gen := func() (quiz, bool, error) { return tb.generateQuiz(ctx, "what we have in r2?", false) }
+	gen4 := func() (quiz, bool, string, error) { return tb.generateQuiz(ctx, "what we have in r2?", false) }
+	gen := func() (quiz, bool, error) {
+		q, ok, _, err := tb.generateQuiz(ctx, "what we have in r2?", false)
+		return q, ok, err
+	}
 
 	makes, checks = []string{broken, modelQuizJSON}, []string{checkOK}
 	if q, ok, err := gen(); err != nil || !ok || q.Rule.Title == "" || !strings.Contains(tb.calls[1], "REJECTED") {
@@ -277,9 +282,18 @@ func TestGenerateQuizRetry(t *testing.T) {
 		t.Fatalf("a failing checker keeps the validated quiz: ok=%v err=%v", ok, err)
 	}
 	n := tb.nCalls()
-	makes, checks = []string{`{"clean": true}`}, nil
-	if _, ok, err := tb.generateQuiz(ctx, "how can we add the new v4 to stg?", false); err != nil || ok || tb.nCalls() != n+1 {
-		t.Fatalf("clean = no quiz, no checker: ok=%v err=%v", ok, err)
+	makes, checks = []string{`{"clean": true, "praise": "🎯 \"how can we add\" — can before we."}`}, nil
+	if _, ok, praise, err := tb.generateQuiz(ctx, "how can we add the new v4 to stg?", false); err != nil || ok || tb.nCalls() != n+1 || !strings.Contains(praise, "can before we") {
+		t.Fatalf("clean = no quiz, no checker, a praise line: ok=%v praise=%q err=%v", ok, praise, err)
+	}
+	// A mistake first and "clean" only on the retry: no quiz and no praise.
+	makes, checks = []string{broken, `{"clean": true, "praise": "✅ nice"}`}, nil
+	if _, ok, praise, err := gen4(); !errors.Is(err, errQuizUnsure) || ok || praise != "" {
+		t.Fatalf("clean only on the retry must not be praised: ok=%v praise=%q err=%v", ok, praise, err)
+	}
+	makes, checks = []string{broken, broken}, nil
+	if _, _, _, err := gen4(); !errors.Is(err, errQuizRejected) {
+		t.Fatalf("two rejections are errQuizRejected (the streak breaks): %v", err)
 	}
 }
 
@@ -332,9 +346,10 @@ func TestApplyCheck(t *testing.T) {
 // --- the wall -------------------------------------------------------------
 
 type quizStub struct {
-	mu    sync.Mutex
-	texts []string
-	err   error
+	mu     sync.Mutex
+	texts  []string
+	err    error
+	praise string // the clean verdict's line
 }
 
 func (s *quizStub) n() int { s.mu.Lock(); defer s.mu.Unlock(); return len(s.texts) }
@@ -350,23 +365,23 @@ func quizBot(t *testing.T) (*testBot, *quizStub) {
 		t.Fatal(err)
 	}
 	st := &quizStub{}
-	tb.makeQuiz = func(_ context.Context, text string, spanish bool) (quiz, bool, error) {
+	tb.makeQuiz = func(_ context.Context, text string, spanish bool) (quiz, bool, string, error) {
 		st.mu.Lock()
 		st.texts = append(st.texts, text)
-		err := st.err
+		err, praise := st.err, st.praise
 		st.mu.Unlock()
 		if err != nil {
-			return quiz{}, false, err
+			return quiz{}, false, "", err
 		}
 		if !strings.Contains(text, "we have") && !spanish {
-			return quiz{}, false, nil
+			return quiz{}, false, praise, nil
 		}
 		q := goodQuiz()
 		q.ID, q.Source = newQuizID(), text
 		if spanish {
 			q.Kind = quizSpanish
 		}
-		return q, true, nil
+		return q, true, "", nil
 	}
 	return tb, st
 }
@@ -630,10 +645,13 @@ func TestQuizSwitches(t *testing.T) {
 // One quiz at a time: a second message while the first quiz is being made
 // doesn't start another one.
 func TestQuizOneAtATime(t *testing.T) {
+	old := praiseWait
+	praiseWait = 50 * time.Millisecond // the 1st answer waits for a verdict that is held back
+	t.Cleanup(func() { praiseWait = old })
 	tb, st := quizBot(t)
 	release := make(chan struct{})
 	inner := tb.makeQuiz
-	tb.makeQuiz = func(ctx context.Context, text string, spanish bool) (quiz, bool, error) {
+	tb.makeQuiz = func(ctx context.Context, text string, spanish bool) (quiz, bool, string, error) {
 		<-release
 		return inner(ctx, text, spanish)
 	}
@@ -684,7 +702,7 @@ func TestQuizCallsAreBare(t *testing.T) {
 		}
 		return claude.Result{Text: modelQuizJSON}, nil
 	}
-	if _, ok, err := tb.generateQuiz(context.Background(), "what we have in r2?", false); err != nil || !ok {
+	if _, ok, _, err := tb.generateQuiz(context.Background(), "what we have in r2?", false); err != nil || !ok {
 		t.Fatalf("quiz: ok=%v err=%v", ok, err)
 	}
 	if len(opts) != 2 {

@@ -373,7 +373,8 @@ func validateWrite(p quizPuzzle, q quiz, bad func(string, ...any)) {
 // quizVerdict is what the model returns: clean, or a quiz without the fields
 // the engine fills (id, created, source, the reorder tiles).
 type quizVerdict struct {
-	Clean bool `json:"clean"`
+	Clean  bool   `json:"clean"`
+	Praise string `json:"praise"` // clean: one line congratulating him (quizpraise.go)
 	quiz
 }
 
