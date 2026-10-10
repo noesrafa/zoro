@@ -25,7 +25,9 @@ package bot
 //     gets ONE line ("🧩 New quiz in your hub: <link> — 📌 <rule>"); the others
 //     stack up quietly. /gate shows how many are to do and the link.
 //   - At start (quizLoop → hubInit): no hub.json yet → it is built from the
-//     q/*.json already there (the practice quiz marked practice). A wall left by
+//     q/*.json already there (the practice quiz marked practice); one that
+//     exists gets the q/ quizzes it doesn't list (the old engine published
+//     quizzes without adding them). A wall left by
 //     the old engine (<state>/quiz.json) goes into the hub and is deleted; the
 //     messages it kept in <state>/quiz-held.jsonl are answered as one turn, in
 //     order (releaseWallQueue) — none is lost.
@@ -210,15 +212,15 @@ func (b *Bot) hubToDo() (int, error) {
 	return b.hubToDoLocked(hub, ""), nil
 }
 
-// hubInit runs once at start: the hub exists (built from q/ if it didn't), an
-// old wall is moved into it, and the old wall's queue is answered.
+// hubInit runs once at start: the hub exists (built from q/ if it didn't),
+// with every quiz in q/ (the old engine published quizzes without adding them),
+// an old wall is moved into it, and the old wall's queue is answered.
 func (b *Bot) hubInit() {
 	if b.cfg.QuizDir != "" {
-		b.quizMu.Lock()
-		_, err := b.readHubLocked()
-		b.quizMu.Unlock()
-		if err != nil {
+		if n, err := b.syncHub(); err != nil {
 			b.log.Error("quiz hub: could not read or build hub.json", "err", err)
+		} else if n > 0 {
+			b.log.Info("quiz hub: added the quizzes it was missing", "n", n)
 		}
 		b.migrateWall()
 	}
@@ -227,6 +229,35 @@ func (b *Bot) hubInit() {
 		b.log.Info("quiz hub: answering the messages the old quiz wall kept")
 		b.releaseWallQueue()
 	}
+}
+
+// syncHub adds to hub.json the quizzes in q/ it doesn't list (n of them).
+func (b *Bot) syncHub() (n int, err error) {
+	b.quizMu.Lock()
+	defer b.quizMu.Unlock()
+	hub, err := b.readHubLocked()
+	if err != nil {
+		return 0, err
+	}
+	all, err := b.backfillHub()
+	if err != nil {
+		return 0, err
+	}
+	known := map[string]bool{}
+	for _, e := range hub {
+		known[e.ID] = true
+	}
+	for _, e := range all {
+		if !known[e.ID] {
+			hub = append(hub, e)
+			n++
+		}
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	sortHub(hub)
+	return n, b.writeHubLocked(hub)
 }
 
 // migrateWall moves the old engine's pending quiz into the hub and deletes the

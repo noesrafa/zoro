@@ -565,7 +565,7 @@ func writeTestQuiz(t *testing.T, tb *testBot, id, created, title string, extra s
 
 // No hub.json yet: it is built from the quizzes already in q/ (newest first,
 // the practice quiz marked), and the solved ones don't count as to do. An
-// existing hub.json is left as it is.
+// existing hub.json keeps its entries and gets the q/ quizzes it lacks.
 func TestQuizHubBackfill(t *testing.T) {
 	tb, _ := quizBot(t)
 	writeTestQuiz(t, tb, "aaaaaaaaaa01", "2026-10-09T19:00:00Z", "Old one", "")
@@ -591,13 +591,20 @@ func TestQuizHubBackfill(t *testing.T) {
 		t.Fatalf("to do = not solved, not practice: %d", n)
 	}
 
-	// Already there: not rebuilt.
-	if err := os.WriteFile(tb.hubFile(), []byte(`[{"id":"aaaaaaaaaa02","title":"Kept","kind":"grammar","created":"x"}]`), 0o644); err != nil {
+	// Already there: kept as it is, only the q/ quizzes it doesn't list are
+	// added (the old engine published without adding them).
+	if err := os.WriteFile(tb.hubFile(), []byte(`[{"id":"aaaaaaaaaa02","title":"Kept","kind":"grammar","created":"2026-10-10T12:00:00Z"}]`), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	writeTestQuiz(t, tb, "aaaaaaaaaa04", "2026-10-10T14:00:00Z", "Made by the old engine", "")
 	tb.hubInit()
-	if hub := tb.hub(t); len(hub) != 1 || hub[0].Title != "Kept" {
-		t.Fatalf("an existing hub.json is not rebuilt: %+v", hub)
+	hub = tb.hub(t)
+	if len(hub) != 5 || hub[0].ID != "aaaaaaaaaa04" || hub[1].Title != "Kept" {
+		t.Fatalf("an existing hub.json is kept and completed: %+v", hub)
+	}
+	tb.hubInit()
+	if len(tb.hub(t)) != 5 {
+		t.Fatal("a second start adds nothing")
 	}
 
 	// The first quiz the engine makes on a site with no hub.json yet: the
