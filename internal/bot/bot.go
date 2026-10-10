@@ -72,7 +72,7 @@ Commands:
 /ls [path] — list VM files
 /stats — VM + git repo status
 /cancel — stop the current task
-/revivir — Claude login days left per agent; /revivir_zoro · /revivir_sky · /revivir_tequila re-login from the phone (send the link, paste the code)
+/revivir — Claude login days left per agent; /revivir_zoro · /revivir_sky · /revivir_tequila · /revivir_rinzler re-login from the phone (send the link, paste the code)
 /redeploy — rebuild my code + restart (apply changes)
 /update — pull latest code from GitHub + rebuild + restart
 /restart — restart me

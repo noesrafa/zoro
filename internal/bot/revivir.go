@@ -78,7 +78,7 @@ func (b *Bot) scriptRevivir(ctx context.Context, d time.Duration, args ...string
 
 func (b *Bot) revivir(chatID int64, ag string) {
 	ctx := context.Background()
-	links := "Para revivir uno toca: /revivir_zoro · /revivir_sky · /revivir_tequila"
+	links := "Para revivir uno toca: /revivir_zoro · /revivir_sky · /revivir_tequila · /revivir_rinzler"
 	if ag == "" {
 		b.send(ctx, chatID, "🔑 Logins de Claude (duran ~30 días):\n"+b.scriptRevivir(ctx, 30*time.Second, "estado")+"\n\n"+links)
 		return
