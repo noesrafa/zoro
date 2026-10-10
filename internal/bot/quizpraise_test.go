@@ -70,7 +70,7 @@ func TestQuizPraiseCleanThenMistake(t *testing.T) {
 	// A mistake: quiz, no praise, streak 0 (best kept).
 	n := tb.nSent()
 	tb.runJob(ownerJob("what we have in r2?"))
-	if tb.sentWith("Quick quiz") != 1 || tb.nSent() != n+2 {
+	if tb.sentWith("New quiz in your hub") != 1 || tb.nSent() != n+2 {
 		t.Fatalf("a mistake gets the answer and the quiz only: sent=%q", tb.sent[n:])
 	}
 	for _, s := range tb.sent[n:] {
@@ -109,7 +109,7 @@ func TestQuizPraiseNotFor(t *testing.T) {
 	if st.n() != 0 || tb.sentWith("✅ nice") != 0 || tb.loadStreak().Streak != 2 {
 		t.Fatalf("nothing judged, nothing praised: judged=%q sent=%q streak=%+v", st.texts, tb.sent, tb.loadStreak())
 	}
-	if heldQuizText([]pendingMsg{{Transcripts: []string{"how is Tequila doing today"}}}) != "" {
+	if wallQueueQuizText([]pendingMsg{{Transcripts: []string{"how is Tequila doing today"}}}) != "" {
 		t.Fatal("voice notes are never judged, so never praised")
 	}
 
@@ -130,7 +130,7 @@ func TestQuizPraiseNotFor(t *testing.T) {
 		t.Fatalf("Spanish is never praised: sent=%q", tb.sent)
 	}
 	// Gate off: nothing at all.
-	if _, err := tb.gateOff(); err != nil {
+	if err := tb.gateOff(); err != nil {
 		t.Fatal(err)
 	}
 	called := false

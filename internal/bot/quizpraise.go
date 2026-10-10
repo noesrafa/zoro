@@ -40,7 +40,7 @@ import (
 // praiseWait is the longest the answer waits for the verdict (a var for tests).
 // A clean verdict takes ~4-5 s (one short call); a mistake's takes 10-20 s
 // (the quiz and its checker) and its answer should not wait for it, so this is
-// short: only an answer faster than it is held, and only up to it.
+// short: only an answer faster than it waits, and only up to it.
 var praiseWait = 8 * time.Second
 
 const (

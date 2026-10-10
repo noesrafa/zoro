@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -343,7 +344,7 @@ func TestApplyCheck(t *testing.T) {
 	}
 }
 
-// --- the wall -------------------------------------------------------------
+// --- the hub --------------------------------------------------------------
 
 type quizStub struct {
 	mu     sync.Mutex
@@ -377,7 +378,7 @@ func quizBot(t *testing.T) (*testBot, *quizStub) {
 			return quiz{}, false, praise, nil
 		}
 		q := goodQuiz()
-		q.ID, q.Source = newQuizID(), text
+		q.ID, q.Source, q.Created = newQuizID(), text, time.Now().UTC().Format(time.RFC3339)
 		if spanish {
 			q.Kind = quizSpanish
 		}
@@ -392,22 +393,32 @@ func (tb *testBot) runJob(j job) {
 	tb.quizWG.Wait()
 }
 
-// solve does what the page's PUT does.
-func (tb *testBot) solve(t *testing.T) {
+// hub reads hub.json as the page does.
+func (tb *testBot) hub(t *testing.T) []hubEntry {
 	t.Helper()
-	p, ok := tb.pendingQuiz()
-	if !ok {
-		t.Fatal("no pending quiz to solve")
+	raw, err := os.ReadFile(tb.hubFile())
+	if err != nil {
+		t.Fatalf("hub.json: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(tb.solvedFile(p.ID)), 0o755); err != nil {
+	var hub []hubEntry
+	if err := json.Unmarshal(raw, &hub); err != nil {
+		t.Fatalf("hub.json: %v", err)
+	}
+	return hub
+}
+
+// solve does what the page's PUT does.
+func (tb *testBot) solve(t *testing.T, id string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(tb.solvedFile(id)), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(tb.solvedFile(p.ID), []byte("1"), 0o644); err != nil {
+	if err := os.WriteFile(tb.solvedFile(id), []byte("1"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
 
-// takeJob pops the job quizTick queued (the release turn).
+// takeJob pops the job quizTick queued (the old wall's release turn).
 func (tb *testBot) takeJob(t *testing.T) job {
 	t.Helper()
 	select {
@@ -419,83 +430,277 @@ func (tb *testBot) takeJob(t *testing.T) job {
 	return job{}
 }
 
-func TestQuizWallHoldsAndReleasesInOrder(t *testing.T) {
+const hubNotice = "🧩 New quiz in your hub: https://coach.example/ — 📌 Questions: do/does/did first"
+
+// noWallTexts: what the wall used to say. None of it may ever be sent.
+func noWallTexts(t *testing.T, tb *testBot) {
+	t.Helper()
+	for _, bad := range []string{"before my next answer", "Solve the quiz first", "start with ! to skip", "held"} {
+		if tb.sentWith(bad) != 0 {
+			t.Fatalf("the wall's text %q went out: %q", bad, tb.sent)
+		}
+	}
+}
+
+// Nothing ever waits: every message is answered right away, the quiz is
+// published with "hub": true and goes into hub.json, and there is no wall file.
+func TestQuizNeverHolds(t *testing.T) {
 	tb, st := quizBot(t)
 	tb.runJob(ownerJob("what we have in r2?"))
 	if tb.nCalls() != 1 || st.n() != 1 {
 		t.Fatalf("the message must be answered AND judged: calls=%d quiz=%d", tb.nCalls(), st.n())
 	}
-	p, ok := tb.pendingQuiz()
-	if !ok || tb.sentWith("🧩 Quick quiz before my next answer: https://coach.example/?q="+p.ID) != 1 || tb.sentWith("Questions: do/does/did first") != 1 {
-		t.Fatalf("expected the quiz link, sent=%q", tb.sent)
+	if tb.sentWith(hubNotice) != 1 {
+		t.Fatalf("expected the hub line, sent=%q", tb.sent)
 	}
-	if _, err := os.Stat(tb.quizFile(p.ID)); err != nil {
-		t.Fatalf("quiz JSON must be published: %v", err)
+	hub := tb.hub(t)
+	if len(hub) != 1 || hub[0].Title != "Questions: do/does/did first" || hub[0].Kind != quizGrammar || hub[0].Created == "" {
+		t.Fatalf("the quiz must be in the hub: %+v", hub)
+	}
+	raw, err := os.ReadFile(tb.quizFile(hub[0].ID))
+	if err != nil || !strings.Contains(string(raw), `"hub": true`) {
+		t.Fatalf("quiz JSON must be published with \"hub\": true: %v %s", err, raw)
 	}
 
-	// Wall up: held, ONE nudge, no Claude call — even for "ok".
+	// The next messages — short, long, another mistake — are answered at once.
 	tb.runJob(ownerJob("ok dale"))
 	tb.runJob(ownerJob("and how is tequila doing"))
-	if tb.nCalls() != 1 || tb.sentWith("🧩 Solve the quiz first: "+p.URL+" (start with ! to skip)") != 1 {
-		t.Fatalf("held messages must not reach Claude and nudge once: calls=%d sent=%q", tb.nCalls(), tb.sent)
-	}
-	if msgs, _ := readPending(tb.quizHeldFile()); len(msgs) != 2 {
-		t.Fatalf("both messages must be held, got %d", len(msgs))
+	if tb.nCalls() != 3 {
+		t.Fatalf("no message may wait for the quiz: calls=%d", tb.nCalls())
 	}
 	tb.quizTick()
 	if len(tb.jobs) != 0 {
-		t.Fatal("nothing is released before the quiz is solved")
+		t.Fatal("nothing is queued: nothing waited")
+	}
+	for _, f := range []string{tb.quizWallFile(), tb.wallQueueFile()} {
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Fatalf("no wall files: %s", f)
+		}
+	}
+	noWallTexts(t, tb)
+}
+
+// Three quizzes in a row: all published, all in the hub (newest first), and ONE
+// line — the others stack up quietly. Once all are solved the next one is
+// announced again; with one still to do it isn't.
+func TestQuizHubStacksAndTellsOnce(t *testing.T) {
+	tb, st := quizBot(t)
+	for _, m := range []string{"what we have in r2?", "and what we have in the mac?", "so what we have for today?"} {
+		tb.runJob(ownerJob(m))
+	}
+	if st.n() != 3 || tb.nCalls() != 3 {
+		t.Fatalf("3 judged, 3 answered: quiz=%d calls=%d", st.n(), tb.nCalls())
+	}
+	hub := tb.hub(t)
+	if len(hub) != 3 {
+		t.Fatalf("3 quizzes in the hub: %+v", hub)
+	}
+	for _, e := range hub {
+		if _, err := os.Stat(tb.quizFile(e.ID)); err != nil {
+			t.Fatalf("each quiz is published: %v", err)
+		}
+	}
+	if q := readQuizFile(t, tb, hub[0].ID); q.Source != "so what we have for today?" {
+		t.Fatalf("newest first: %+v", hub)
+	}
+	if q := readQuizFile(t, tb, hub[2].ID); q.Source != "what we have in r2?" {
+		t.Fatalf("oldest last: %+v", hub)
+	}
+	if tb.sentWith("🧩") != 1 || tb.sentWith(hubNotice) != 1 {
+		t.Fatalf("only the first one is announced: %q", tb.sent)
+	}
+	if g := tb.gateText(); !strings.Contains(g, "🧩 Quiz hub: 3 to do — https://coach.example/") {
+		t.Fatalf("/gate shows the count and the link: %q", g)
 	}
 
-	// Solved → wall down → one turn with both, in order.
-	tb.solve(t)
-	tb.quizTick()
-	if _, ok := tb.pendingQuiz(); ok {
-		t.Fatal("the wall must come down once solved")
+	// Two solved, one left: a new one stacks quietly.
+	tb.solve(t, hub[0].ID)
+	tb.solve(t, hub[1].ID)
+	tb.runJob(ownerJob("where we have the keys?"))
+	if tb.sentWith("🧩") != 1 {
+		t.Fatalf("one still to do: no line: %q", tb.sent)
+	}
+	// All solved: the next one is announced.
+	for _, e := range tb.hub(t) {
+		tb.solve(t, e.ID)
+	}
+	if g := tb.gateText(); !strings.Contains(g, "🧩 Quiz hub: 0 to do") {
+		t.Fatalf("/gate after solving: %q", g)
+	}
+	tb.runJob(ownerJob("why we have two backups?"))
+	if tb.sentWith(hubNotice) != 2 || len(tb.hub(t)) != 5 {
+		t.Fatalf("0 → 1 again: one more line: %q", tb.sent)
+	}
+	noWallTexts(t, tb)
+}
+
+func readQuizFile(t *testing.T, tb *testBot, id string) quiz {
+	t.Helper()
+	raw, err := os.ReadFile(tb.quizFile(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var q quiz
+	if err := json.Unmarshal(raw, &q); err != nil {
+		t.Fatal(err)
+	}
+	return q
+}
+
+func writeTestQuiz(t *testing.T, tb *testBot, id, created, title string, extra string) {
+	t.Helper()
+	q := goodQuiz()
+	q.ID, q.Created, q.Rule.Title = id, created, title
+	raw, _ := json.Marshal(q)
+	if extra != "" {
+		raw = []byte(strings.TrimSuffix(string(raw), "}") + "," + extra + "}")
+	}
+	if err := os.MkdirAll(filepath.Dir(tb.quizFile(id)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tb.quizFile(id), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// No hub.json yet: it is built from the quizzes already in q/ (newest first,
+// the practice quiz marked), and the solved ones don't count as to do. An
+// existing hub.json is left as it is.
+func TestQuizHubBackfill(t *testing.T) {
+	tb, _ := quizBot(t)
+	writeTestQuiz(t, tb, "aaaaaaaaaa01", "2026-10-09T19:00:00Z", "Old one", "")
+	writeTestQuiz(t, tb, "aaaaaaaaaa02", "2026-10-10T12:00:00Z", "New one", "")
+	writeTestQuiz(t, tb, quizPracticeID, "2026-10-09T22:00:00Z", "Practice", `"practice":true`)
+	writeTestQuiz(t, tb, "aaaaaaaaaa03", "2026-10-09T23:00:00Z", "Hand practice", `"practice":true`)
+	_ = os.WriteFile(filepath.Join(tb.cfg.QuizDir, "q", "broken0000xx.json"), []byte("{"), 0o644)
+	tb.solve(t, "aaaaaaaaaa01")
+
+	tb.hubInit()
+	hub := tb.hub(t)
+	var ids []string
+	for _, e := range hub {
+		ids = append(ids, e.ID)
+	}
+	if strings.Join(ids, ",") != "aaaaaaaaaa02,aaaaaaaaaa03,"+quizPracticeID+",aaaaaaaaaa01" {
+		t.Fatalf("all valid quizzes, newest first: %v", ids)
+	}
+	if !hub[1].Practice || !hub[2].Practice || hub[0].Practice || hub[0].Title != "New one" || hub[0].Kind != quizGrammar {
+		t.Fatalf("practice marked, titles and kinds kept: %+v", hub)
+	}
+	if n, _ := tb.hubToDo(); n != 1 {
+		t.Fatalf("to do = not solved, not practice: %d", n)
+	}
+
+	// Already there: not rebuilt.
+	if err := os.WriteFile(tb.hubFile(), []byte(`[{"id":"aaaaaaaaaa02","title":"Kept","kind":"grammar","created":"x"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tb.hubInit()
+	if hub := tb.hub(t); len(hub) != 1 || hub[0].Title != "Kept" {
+		t.Fatalf("an existing hub.json is not rebuilt: %+v", hub)
+	}
+
+	// The first quiz the engine makes on a site with no hub.json yet: the
+	// hub is built from q/ (it already holds the new quiz) and it's still told.
+	tb2, _ := quizBot(t)
+	tb2.runJob(ownerJob("what we have in r2?"))
+	if len(tb2.hub(t)) != 1 || tb2.sentWith(hubNotice) != 1 {
+		t.Fatalf("first quiz on a fresh site: hub=%+v sent=%q", tb2.hub(t), tb2.sent)
+	}
+}
+
+// writeOldWall leaves what the old engine left: its pending quiz (published)
+// in <state>/quiz.json and two messages it kept in quiz-held.jsonl.
+func writeOldWall(t *testing.T, tb *testBot) string {
+	t.Helper()
+	id := "oldwall00001"
+	writeTestQuiz(t, tb, id, "2026-10-10T13:00:00Z", "Questions: do/does/did first", "")
+	w, _ := json.Marshal(map[string]any{"id": id, "url": "https://coach.example/?q=" + id, "title": "Questions: do/does/did first", "created": "2026-10-10T13:00:00Z", "chat_id": 1, "nudged": true})
+	if err := os.WriteFile(tb.quizWallFile(), w, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []string{"are you there?", "and how is tequila doing"} {
+		if err := appendPending(tb.wallQueueFile(), pendingMsg{ChatID: 1, From: "Rafa", At: "2026-10-10 13:05", Text: m}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return id
+}
+
+// The old wall at start: its quiz goes into the hub, the wall file is deleted
+// and the messages it kept are answered as one turn, in order — none is lost.
+func TestQuizMigratesOldWall(t *testing.T) {
+	tb, st := quizBot(t)
+	id := writeOldWall(t, tb)
+	if err := os.WriteFile(tb.hubFile(), []byte(`[]`), 0o644); err != nil { // a hub that doesn't list it yet
+		t.Fatal(err)
+	}
+	tb.hubInit()
+	if _, err := os.Stat(tb.quizWallFile()); !os.IsNotExist(err) {
+		t.Fatal("the old wall must be deleted")
+	}
+	hub := tb.hub(t)
+	if len(hub) != 1 || hub[0].ID != id || hub[0].Title != "Questions: do/does/did first" {
+		t.Fatalf("the old wall's quiz goes into the hub: %+v", hub)
 	}
 	tb.runJob(tb.takeJob(t))
-	if tb.nCalls() != 2 {
+	if tb.nCalls() != 1 {
 		t.Fatalf("the release turn must run: calls=%d", tb.nCalls())
 	}
-	got := tb.calls[1]
-	if i, k := strings.Index(got, "ok dale"), strings.Index(got, "and how is tequila doing"); i < 0 || k < i {
-		t.Fatalf("held messages must arrive in order: %q", got)
+	got := tb.calls[0]
+	if i, k := strings.Index(got, "are you there?"), strings.Index(got, "and how is tequila doing"); i < 0 || k < i {
+		t.Fatalf("the old wall's messages arrive in order: %q", got)
 	}
-	if _, err := os.Stat(tb.quizHeldFile()); !os.IsNotExist(err) {
-		t.Fatal("the held queue must be cleared after the turn")
+	if _, err := os.Stat(tb.wallQueueFile()); !os.IsNotExist(err) {
+		t.Fatal("the old queue must be cleared after the turn")
 	}
-	if st.n() != 2 || st.texts[1] != "and how is tequila doing" {
-		t.Fatalf("the released messages get judged too (short ones skipped): %q", st.texts)
+	if st.n() != 1 || st.texts[0] != "are you there?\nand how is tequila doing" {
+		t.Fatalf("those messages get judged too: %q", st.texts)
 	}
 	tb.quizTick()
 	if len(tb.jobs) != 0 {
 		t.Fatal("no second release")
 	}
-	tb.runJob(ownerJob("thanks man"))
-	if tb.nCalls() != 3 {
-		t.Fatal("after the release, messages are answered again")
+	tb.hubInit() // a second start: nothing to migrate
+	if len(tb.hub(t)) != 1 || len(tb.jobs) != 0 {
+		t.Fatal("a second start changes nothing")
+	}
+	noWallTexts(t, tb)
+}
+
+// A paused engine keeps the old wall's messages until /start.
+func TestQuizMigratePaused(t *testing.T) {
+	tb, _ := quizBot(t)
+	writeOldWall(t, tb)
+	pause(t, tb)
+	tb.hubInit()
+	tb.quizTick()
+	if len(tb.jobs) != 0 {
+		t.Fatal("paused: nothing released")
+	}
+	if _, err := os.Stat(tb.quizWallFile()); !os.IsNotExist(err) {
+		t.Fatal("the wall goes even while paused (it holds nothing new)")
+	}
+	if err := os.Remove(tb.pauseFile()); err != nil {
+		t.Fatal(err)
+	}
+	tb.quizTick()
+	tb.runJob(tb.takeJob(t))
+	if tb.nCalls() != 1 || !strings.Contains(tb.calls[0], "are you there?") {
+		t.Fatalf("after the pause they are answered: %q", tb.calls)
 	}
 }
 
-func TestQuizWallLetsThrough(t *testing.T) {
+// !, /commands and crons are answered and never judged.
+func TestQuizSkips(t *testing.T) {
 	tb, st := quizBot(t)
-	tb.runJob(ownerJob("what we have in r2?"))
-	if _, ok := tb.pendingQuiz(); !ok {
-		t.Fatal("no wall")
-	}
 	tb.runJob(ownerJob("! urgent: what we have in the backups?"))
 	tb.runJob(ownerJob("/deep-research what we have in r2"))
 	tb.runJob(job{chatID: 1, prompt: "cron prompt", label: "⏰ gastos"})
 	tb.fireCron(cron.Job{ID: "x", Prompt: "p"})
 	tb.runJob(tb.takeJob(t))
-	if tb.nCalls() != 5 {
-		t.Fatalf("!, /commands and crons must pass the wall: calls=%d", tb.nCalls())
-	}
-	if st.n() != 1 || tb.sentWith("Solve the quiz first") != 0 {
-		t.Fatalf("they make no quiz and get no nudge: quiz=%d sent=%q", st.n(), tb.sent)
-	}
-	if _, ok := tb.pendingQuiz(); !ok {
-		t.Fatal("the quiz stays pending after a !")
+	if tb.nCalls() != 4 || st.n() != 0 || tb.sentWith("🧩") != 0 {
+		t.Fatalf("!, /commands and crons: answered, no quiz: calls=%d quiz=%d sent=%q", tb.nCalls(), st.n(), tb.sent)
 	}
 }
 
@@ -515,7 +720,7 @@ func TestQuizNoQuizFor(t *testing.T) {
 	if got := quizCandidate([]string{"check https://x.com/a/b?s=46 this have utility in our workflow?"}); got != "check  this have utility in our workflow?" {
 		t.Fatalf("links are cut out: %q", got)
 	}
-	if heldQuizText([]pendingMsg{{Text: "what we have", Transcripts: []string{"we have"}}}) != "" {
+	if wallQueueQuizText([]pendingMsg{{Text: "what we have", Transcripts: []string{"we have"}}}) != "" {
 		t.Fatal("voice notes make no quiz")
 	}
 	if quizCandidate(nil) != "" {
@@ -523,90 +728,38 @@ func TestQuizNoQuizFor(t *testing.T) {
 	}
 }
 
-// A quiz that can't be made (rejected twice, timeout…) = no wall: the next
-// message is answered.
-func TestQuizBrokenNeverBlocks(t *testing.T) {
+// A quiz that can't be made (rejected twice, timeout…) = nothing in the hub,
+// no line.
+func TestQuizBrokenGoesNowhere(t *testing.T) {
 	tb, st := quizBot(t)
 	st.err = errors.New("rejected twice")
 	tb.runJob(ownerJob("what we have in r2?"))
 	tb.runJob(ownerJob("and what we have in the mac?"))
 	if tb.nCalls() != 2 || tb.sentWith("🧩") != 0 {
-		t.Fatalf("no quiz = no wall: calls=%d sent=%q", tb.nCalls(), tb.sent)
+		t.Fatalf("no quiz, both answered: calls=%d sent=%q", tb.nCalls(), tb.sent)
 	}
-	if _, ok := tb.pendingQuiz(); ok {
-		t.Fatal("no wall")
+	if n, _ := tb.hubToDo(); n != 0 || len(tb.hub(t)) != 0 {
+		t.Fatal("nothing in the hub")
 	}
 }
 
-// The wall survives a restart (the state is on disk), and /gate off takes it
-// down and releases the queue.
-func TestQuizRestartAndGateOff(t *testing.T) {
+// /gate off: no new quizzes, the hub stays; the texts don't promise a wall.
+func TestQuizGateOffKeepsHub(t *testing.T) {
 	tb, _ := quizBot(t)
+	tb.handleGate(context.Background(), 1, []string{"/gate", "on"})
 	tb.runJob(ownerJob("what we have in r2?"))
-	p, _ := tb.pendingQuiz()
-
-	// "restart": a bot that has to load everything from disk.
-	tb.quizCur, tb.quizLoaded = nil, false
-	tb.quizHeld.Store(false)
-	tb.runJob(ownerJob("are you there?"))
-	if tb.nCalls() != 1 || tb.sentWith("Solve the quiz first: "+p.URL) != 1 {
-		t.Fatalf("after a restart the wall must still hold: calls=%d sent=%q", tb.nCalls(), tb.sent)
-	}
-	tb.quizCur, tb.quizLoaded = nil, false
-	tb.quizHeld.Store(false)
-	tb.runJob(ownerJob("hello again man"))
-	if tb.sentWith("Solve the quiz first") != 1 {
-		t.Fatal("the nudge is once per quiz, restart or not")
-	}
-
-	n, err := tb.gateOff()
-	if err != nil || n != 2 {
-		t.Fatalf("/gate off: n=%d err=%v", n, err)
-	}
-	if _, ok := tb.pendingQuiz(); ok || tb.set.Get().Gate {
-		t.Fatal("/gate off takes the wall down")
-	}
-	tb.runJob(tb.takeJob(t))
-	if tb.nCalls() != 2 || !strings.Contains(tb.calls[1], "are you there?") || !strings.Contains(tb.calls[1], "hello again man") {
-		t.Fatalf("/gate off must release the held messages: %q", tb.calls)
+	tb.handleGate(context.Background(), 1, []string{"/gate", "off"})
+	if tb.set.Get().Gate || len(tb.hub(t)) != 1 {
+		t.Fatal("/gate off: gate off, hub kept")
 	}
 	tb.runJob(ownerJob("what we have in the mac?"))
-	if tb.nCalls() != 3 || tb.sentWith("Quick quiz") != 1 {
+	if tb.nCalls() != 2 || len(tb.hub(t)) != 1 || tb.sentWith("New quiz") != 1 {
 		t.Fatal("gate off: answered, no quiz")
 	}
-}
-
-// A paused engine keeps the held messages until /start; a quiz whose page is
-// gone can't be solved, so it doesn't keep the wall up.
-func TestQuizPausedAndMissingPage(t *testing.T) {
-	tb, _ := quizBot(t)
-	tb.runJob(ownerJob("what we have in r2?"))
-	tb.runJob(ownerJob("are you there?"))
-	pause(t, tb)
-	tb.solve(t)
-	tb.quizTick()
-	if len(tb.jobs) != 0 {
-		t.Fatal("paused: nothing released")
+	if tb.sentWith("lands in your hub: https://coach.example/") != 1 || tb.sentWith("Your hub stays: https://coach.example/") != 1 {
+		t.Fatalf("/gate on|off texts: %q", tb.sent)
 	}
-	if err := os.Remove(tb.pauseFile()); err != nil {
-		t.Fatal(err)
-	}
-	tb.quizTick()
-	tb.runJob(tb.takeJob(t))
-	if tb.nCalls() != 2 {
-		t.Fatalf("after the pause the held message is answered: calls=%d", tb.nCalls())
-	}
-
-	tb.runJob(ownerJob("and what we have in the mac?"))
-	p, ok := tb.pendingQuiz()
-	if !ok {
-		t.Fatal("expected a second quiz")
-	}
-	_ = os.Remove(tb.quizFile(p.ID))
-	tb.quizTick()
-	if _, ok := tb.pendingQuiz(); ok {
-		t.Fatal("a quiz with no page must not keep the wall")
-	}
+	noWallTexts(t, tb)
 }
 
 // Spanish gets a quiz unless gate_spanish_off; sub-agents (no quiz site) never
@@ -614,8 +767,8 @@ func TestQuizPausedAndMissingPage(t *testing.T) {
 func TestQuizSwitches(t *testing.T) {
 	tb, st := quizBot(t)
 	tb.runJob(ownerJob("oye wey puedes revisar el disco de la vps porfa"))
-	if p, ok := tb.pendingQuiz(); !ok || st.n() != 1 {
-		t.Fatalf("Spanish must get a quiz: %+v", p)
+	if hub := tb.hub(t); len(hub) != 1 || hub[0].Kind != quizSpanish || st.n() != 1 {
+		t.Fatalf("Spanish must get a quiz: %+v", hub)
 	}
 
 	tb2, st2 := quizBot(t)
@@ -630,8 +783,12 @@ func TestQuizSwitches(t *testing.T) {
 	sky.cfg.AgentName, sky.cfg.QuizDir = "sky", ""
 	sky.runJob(ownerJob("what we have in r2?"))
 	sky.runJob(ownerJob("what we have in the mac?"))
+	sky.hubInit()
 	if st3.n() != 0 || sky.nCalls() != 2 {
-		t.Fatalf("no quiz site = no quiz, no wall: quiz=%d calls=%d", st3.n(), sky.nCalls())
+		t.Fatalf("no quiz site = no quiz: quiz=%d calls=%d", st3.n(), sky.nCalls())
+	}
+	if _, err := os.Stat("hub.json"); !os.IsNotExist(err) {
+		t.Fatal("no quiz site: no hub.json anywhere")
 	}
 
 	off, st4 := quizBot(t)
@@ -642,11 +799,11 @@ func TestQuizSwitches(t *testing.T) {
 	}
 }
 
-// One quiz at a time: a second message while the first quiz is being made
-// doesn't start another one.
+// One quiz made at a time: a second message while the first quiz is being made
+// is answered but doesn't start another one.
 func TestQuizOneAtATime(t *testing.T) {
 	old := praiseWait
-	praiseWait = 50 * time.Millisecond // the 1st answer waits for a verdict that is held back
+	praiseWait = 50 * time.Millisecond // the 1st answer waits for a verdict that is kept back
 	t.Cleanup(func() { praiseWait = old })
 	tb, st := quizBot(t)
 	release := make(chan struct{})
@@ -659,23 +816,21 @@ func TestQuizOneAtATime(t *testing.T) {
 	tb.process(context.Background(), ownerJob("and what we have in the mac?"))
 	close(release)
 	tb.quizWG.Wait()
-	if st.n() != 1 || tb.sentWith("Quick quiz") != 1 || tb.nCalls() != 2 {
+	if st.n() != 1 || tb.sentWith("New quiz in your hub") != 1 || tb.nCalls() != 2 || len(tb.hub(t)) != 1 {
 		t.Fatalf("one quiz at a time, both answered: quiz=%d sent=%q calls=%d", st.n(), tb.sent, tb.nCalls())
 	}
 }
 
-// A release turn that fails keeps the held messages and is not re-queued every
-// tick (no error every 3 s); after the wait it runs again and clears the queue.
+// A release turn (the old wall's queue) that fails keeps the messages and is
+// not re-queued every tick; after the wait it runs again and clears the queue.
 func TestQuizReleaseFailureBacksOff(t *testing.T) {
 	tb, _ := quizBot(t)
-	tb.runJob(ownerJob("what we have in r2?"))
-	tb.runJob(ownerJob("are you there?"))
-	tb.solve(t)
+	writeOldWall(t, tb)
 	tb.reply = func(string) (claude.Result, error) { return claude.Result{}, errors.New("boom") }
-	tb.quizTick()
+	tb.hubInit()
 	tb.runJob(tb.takeJob(t))
-	if msgs, _ := readPending(tb.quizHeldFile()); len(msgs) != 1 {
-		t.Fatalf("a failed release keeps the held message, got %d", len(msgs))
+	if msgs, _ := readPending(tb.wallQueueFile()); len(msgs) != 2 {
+		t.Fatalf("a failed release keeps the messages, got %d", len(msgs))
 	}
 	tb.quizTick()
 	if len(tb.jobs) != 0 {
@@ -685,7 +840,7 @@ func TestQuizReleaseFailureBacksOff(t *testing.T) {
 	tb.quizRetryAt.Store(time.Now().Add(-time.Second).UnixNano())
 	tb.quizTick()
 	tb.runJob(tb.takeJob(t))
-	if _, err := os.Stat(tb.quizHeldFile()); !os.IsNotExist(err) || tb.quizRetryAt.Load() != 0 {
+	if _, err := os.Stat(tb.wallQueueFile()); !os.IsNotExist(err) || tb.quizRetryAt.Load() != 0 {
 		t.Fatal("after the wait the release runs and clears the queue")
 	}
 }

@@ -1,37 +1,39 @@
 package bot
 
-// English gate, quiz mode (/gate on). rafiña's ask, 9-oct-2026: "regresa el muro
-// entre tus respuestas, pero en vez de pedirme reescribir la frase me creas un
-// link con una explicación muy simple y 3 puzzles … tu SIGUIENTE respuesta queda
-// bloqueada mientras resuelvo los puzzles". No daily limit; "!" skips.
+// English coach, hub mode (/gate on). rafiña's ask, 10-oct-2026: "I want to
+// change the coach so we dont block the next message but each quiz you generate
+// is stacking in a new hub so I can do everything when I want". It replaces the
+// quiz wall of 9-oct (the next answer waited until the quiz was solved).
 //
-//   - A typed owner message (≥ 3 words, no "!", no code) is ALWAYS answered. In
-//     parallel ONE Sonnet call (low effort, subscription) judges its English:
-//     clean → a short, specific praise before the answer (quizpraise.go); any
-//     grammar, word or word-order mistake → a quiz on the most important one
-//     (strict since 9-oct, "no limits on corrections": only typos, capitals,
-//     punctuation, accents and slang are forgiven); Spanish → a
+//   - A typed owner message (≥ 3 words, no "!", no code) is ALWAYS answered, and
+//     nothing ever waits. In parallel ONE Sonnet call (low effort, subscription)
+//     judges its English: clean → a short, specific praise before the answer
+//     (quizpraise.go); any grammar, word or word-order mistake → a quiz on the
+//     most important one (strict since 9-oct, "no limits on corrections": only
+//     typos, capitals, punctuation, accents and slang are forgiven); Spanish → a
 //     "Say it in English" quiz (settings gate_spanish_off turns that case off).
 //     Each puzzle carries its goal in Mexican Spanish ("es") and a first-miss
-//     "tip"; the rule is one short line plus a ❌/✅ example. validateQuiz checks it: one retry, then no quiz at all — a
-//     broken quiz never blocks.
-//   - The quiz goes to <QuizDir>/q/<id>.json (coach.dominioartificial.com, static
-//     nginx) and the owner gets "🧩 Quick quiz before my next answer: <link>".
-//   - From then on the wall is up: every owner message is HELD in
-//     <state>/quiz-held.jsonl (never dropped) and the first one gets ONE "solve the
-//     quiz first" nudge. Commands (/…), "!" messages, crons and machine turns pass.
-//   - The page PUTs <QuizDir>/solved/<id> (nginx DAV) when the 3 puzzles are done.
-//     quizLoop stats that file every 3 s, only while a quiz is pending; then the
-//     wall comes down and the held messages are answered as one turn, in order.
-//     One quiz at a time: a quiz from the released messages is the next one.
-//   - The pending quiz is <state>/quiz.json, so a restart keeps the wall. /gate
-//     off takes it down and releases the queue too.
+//     "tip"; the rule is one short line plus a ❌/✅ example. validateQuiz checks
+//     it: one retry, then no quiz at all.
+//   - One quiz is made at a time (quizBusy): a message that comes while another
+//     quiz is being made gets no quiz of its own. Any number can be made in a row.
+//   - The quiz goes to <QuizDir>/q/<id>.json with "hub": true
+//     (coach.dominioartificial.com, static nginx) and is added to the hub,
+//     <QuizDir>/hub.json (newest first). The page at / lists the hub; he solves
+//     them whenever he wants and the page PUTs <QuizDir>/solved/<id> (nginx DAV).
+//   - To do = in the hub with no solved/<id>. Only when that goes from 0 to 1 he
+//     gets ONE line ("🧩 New quiz in your hub: <link> — 📌 <rule>"); the others
+//     stack up quietly. /gate shows how many are to do and the link.
+//   - At start (quizLoop → hubInit): no hub.json yet → it is built from the
+//     q/*.json already there (the practice quiz marked practice). A wall left by
+//     the old engine (<state>/quiz.json) goes into the hub and is deleted; the
+//     messages it kept in <state>/quiz-held.jsonl are answered as one turn, in
+//     order (releaseWallQueue) — none is lost.
 //
-// Replaces the bounce-and-rewrite gate (13b6289, 077e226) and its separate praise
-// (faa6504): Zoro's own reply already carries the ✍️/💡/👏 coaching (soul).
-// Only Zoro has a quiz site: QuizDir is empty on the sub-agents, so /gate on does
-// nothing there, and the gate itself stays off by default — Sky and Tequila run
-// this same binary.
+// Before: the bounce-and-rewrite gate (13b6289, 077e226) and its separate praise
+// (faa6504), then the quiz wall (9-oct). Only Zoro has a quiz site: QuizDir is
+// empty on the sub-agents, so /gate on does nothing there, and the gate itself
+// stays off by default — Sky and Tequila run this same binary.
 
 import (
 	"context"
@@ -41,6 +43,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -49,8 +52,10 @@ import (
 )
 
 const (
-	quizStateName = "quiz.json"
-	quizHeldName  = "quiz-held.jsonl"
+	quizHubName    = "hub.json"        // <QuizDir>/hub.json: the page's list
+	quizWallName   = "quiz.json"       // <state>/quiz.json: the old wall, migrated at start
+	wallQueueName  = "quiz-held.jsonl" // <state>/quiz-held.jsonl: the old wall's queue
+	quizPracticeID = "o6b6ulfmn5ld"    // the hand-made practice quiz (FORMATO.md)
 
 	quizEvery   = 3 * time.Second
 	quizRetry   = 5 * time.Minute // a release turn that failed is retried after this, not every tick
@@ -58,18 +63,25 @@ const (
 	quizMaxText = 1500            // longer is a paste, not his typing
 )
 
-// quizPending is <state>/quiz.json: the quiz the wall is waiting for.
-type quizPending struct {
-	ID      string `json:"id"`
-	URL     string `json:"url"`
-	Title   string `json:"title"`
-	Created string `json:"created"`
-	ChatID  int64  `json:"chat_id"`
-	Nudged  bool   `json:"nudged,omitempty"` // the one "solve it first" went out
+// hubEntry is one row of hub.json.
+type hubEntry struct {
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	Kind     string `json:"kind"`
+	Created  string `json:"created"`
+	Practice bool   `json:"practice,omitempty"`
 }
 
-func (b *Bot) quizStateFile() string { return filepath.Join(b.cfg.StateDir, quizStateName) }
-func (b *Bot) quizHeldFile() string  { return filepath.Join(b.cfg.StateDir, quizHeldName) }
+// quizWall is the old engine's <state>/quiz.json (only read, to migrate it).
+type quizWall struct {
+	ID      string `json:"id"`
+	Title   string `json:"title"`
+	Created string `json:"created"`
+}
+
+func (b *Bot) quizWallFile() string  { return filepath.Join(b.cfg.StateDir, quizWallName) }
+func (b *Bot) wallQueueFile() string { return filepath.Join(b.cfg.StateDir, wallQueueName) }
+func (b *Bot) hubFile() string       { return filepath.Join(b.cfg.QuizDir, quizHubName) }
 func (b *Bot) quizFile(id string) string {
 	return filepath.Join(b.cfg.QuizDir, "q", id+".json")
 }
@@ -78,63 +90,175 @@ func (b *Bot) solvedFile(id string) string { return filepath.Join(b.cfg.QuizDir,
 // quizOn: the gate is on and this agent has a quiz site.
 func (b *Bot) quizOn() bool { return b.cfg.QuizDir != "" && b.set.Get().Gate }
 
-func (b *Bot) quizURL(id string) string {
-	return strings.TrimRight(b.cfg.QuizURL, "/") + "/?q=" + id
-}
+func (b *Bot) hubURL() string { return strings.TrimRight(b.cfg.QuizURL, "/") + "/" }
 
-// pendingQuiz returns the quiz the wall waits for (loaded from disk once).
-func (b *Bot) pendingQuiz() (quizPending, bool) {
-	b.quizMu.Lock()
-	defer b.quizMu.Unlock()
-	b.loadQuizLocked()
-	if b.quizCur == nil {
-		return quizPending{}, false
-	}
-	return *b.quizCur, true
-}
+// --- the hub --------------------------------------------------------------
 
-func (b *Bot) loadQuizLocked() {
-	if b.quizLoaded {
-		return
-	}
-	b.quizLoaded = true
-	if raw, err := os.ReadFile(b.quizStateFile()); err == nil {
-		var p quizPending
-		if json.Unmarshal(raw, &p) == nil && p.ID != "" {
-			b.quizCur = &p
+// readHubLocked reads hub.json; a missing one is built from q/*.json first.
+func (b *Bot) readHubLocked() ([]hubEntry, error) {
+	raw, err := os.ReadFile(b.hubFile())
+	if os.IsNotExist(err) {
+		hub, err := b.backfillHub()
+		if err != nil {
+			return nil, err
 		}
+		return hub, b.writeHubLocked(hub)
 	}
-	if _, err := os.Stat(b.quizHeldFile()); err == nil {
-		b.quizHeld.Store(true)
+	if err != nil {
+		return nil, err
 	}
+	var hub []hubEntry
+	if err := json.Unmarshal(raw, &hub); err != nil {
+		return nil, fmt.Errorf("hub.json: %w", err)
+	}
+	return hub, nil
 }
 
-// setQuiz puts the wall up (p) or takes it down (nil), on disk first.
-func (b *Bot) setQuiz(p *quizPending) error {
-	b.quizMu.Lock()
-	defer b.quizMu.Unlock()
-	b.loadQuizLocked()
-	if p == nil {
-		if err := os.Remove(b.quizStateFile()); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		b.quizCur = nil
-		return nil
+func (b *Bot) writeHubLocked(hub []hubEntry) error {
+	if hub == nil {
+		hub = []hubEntry{}
 	}
-	raw, _ := json.MarshalIndent(p, "", "  ")
-	tmp := b.quizStateFile() + ".tmp"
+	raw, _ := json.MarshalIndent(hub, "", "  ")
+	if err := os.MkdirAll(b.cfg.QuizDir, 0o755); err != nil {
+		return err
+	}
+	tmp := b.hubFile() + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, b.quizStateFile()); err != nil {
-		return err
-	}
-	c := *p
-	b.quizCur = &c
-	return nil
+	return os.Rename(tmp, b.hubFile())
 }
 
-// quizPasses: commands and "!" messages always go through the wall.
+// backfillHub lists the quizzes already in q/, newest first.
+func (b *Bot) backfillHub() ([]hubEntry, error) {
+	files, err := filepath.Glob(filepath.Join(b.cfg.QuizDir, "q", "*.json"))
+	if err != nil {
+		return nil, err
+	}
+	var hub []hubEntry
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		var q struct {
+			quiz
+			Practice bool `json:"practice"`
+		}
+		if json.Unmarshal(raw, &q) != nil || q.ID == "" || q.ID+".json" != filepath.Base(f) {
+			continue
+		}
+		hub = append(hub, hubEntry{ID: q.ID, Title: q.Rule.Title, Kind: q.Kind, Created: q.Created,
+			Practice: q.Practice || q.ID == quizPracticeID})
+	}
+	sortHub(hub)
+	return hub, nil
+}
+
+// sortHub: newest first (RFC3339 UTC sorts as text).
+func sortHub(hub []hubEntry) {
+	sort.SliceStable(hub, func(i, j int) bool { return hub[i].Created > hub[j].Created })
+}
+
+// hubToDoLocked counts the quizzes still to do: published, not solved (but
+// not skip). The practice quiz doesn't count — it's there to play with, not a debt.
+func (b *Bot) hubToDoLocked(hub []hubEntry, skip string) int {
+	n := 0
+	for _, e := range hub {
+		if e.Practice || e.ID == skip {
+			continue
+		}
+		if _, err := os.Stat(b.quizFile(e.ID)); err != nil {
+			continue
+		}
+		if _, err := os.Stat(b.solvedFile(e.ID)); os.IsNotExist(err) {
+			n++
+		}
+	}
+	return n
+}
+
+// hubAdd puts a published quiz on top of the hub (once). first: nothing else
+// was to do — the only case that gets a message.
+func (b *Bot) hubAdd(e hubEntry) (first bool, err error) {
+	b.quizMu.Lock()
+	defer b.quizMu.Unlock()
+	hub, err := b.readHubLocked()
+	if err != nil {
+		return false, err
+	}
+	// Not counting itself: a hub built from q/ just now already lists it.
+	first = b.hubToDoLocked(hub, e.ID) == 0
+	for _, h := range hub {
+		if h.ID == e.ID {
+			return first, nil
+		}
+	}
+	hub = append([]hubEntry{e}, hub...)
+	sortHub(hub)
+	return first, b.writeHubLocked(hub)
+}
+
+// hubToDo is the count /gate shows.
+func (b *Bot) hubToDo() (int, error) {
+	b.quizMu.Lock()
+	defer b.quizMu.Unlock()
+	hub, err := b.readHubLocked()
+	if err != nil {
+		return 0, err
+	}
+	return b.hubToDoLocked(hub, ""), nil
+}
+
+// hubInit runs once at start: the hub exists (built from q/ if it didn't), an
+// old wall is moved into it, and the old wall's queue is answered.
+func (b *Bot) hubInit() {
+	if b.cfg.QuizDir != "" {
+		b.quizMu.Lock()
+		_, err := b.readHubLocked()
+		b.quizMu.Unlock()
+		if err != nil {
+			b.log.Error("quiz hub: could not read or build hub.json", "err", err)
+		}
+		b.migrateWall()
+	}
+	if _, err := os.Stat(b.wallQueueFile()); err == nil {
+		b.wallQueued.Store(true)
+		b.log.Info("quiz hub: answering the messages the old quiz wall kept")
+		b.releaseWallQueue()
+	}
+}
+
+// migrateWall moves the old engine's pending quiz into the hub and deletes the
+// wall. If the hub can't be written the wall file stays, for the next start.
+func (b *Bot) migrateWall() {
+	raw, err := os.ReadFile(b.quizWallFile())
+	if err != nil {
+		return
+	}
+	var w quizWall
+	if json.Unmarshal(raw, &w) == nil && w.ID != "" {
+		if qraw, err := os.ReadFile(b.quizFile(w.ID)); err == nil {
+			var q quiz
+			_ = json.Unmarshal(qraw, &q)
+			e := hubEntry{ID: w.ID, Title: q.Rule.Title, Kind: q.Kind, Created: q.Created}
+			if e.Title == "" {
+				e.Title, e.Created = w.Title, w.Created
+			}
+			if _, err := b.hubAdd(e); err != nil {
+				b.log.Error("quiz hub: could not move the old wall's quiz in, keeping it", "err", err)
+				return
+			}
+		}
+	}
+	if err := os.Remove(b.quizWallFile()); err != nil {
+		b.log.Error("quiz hub: could not delete the old wall", "err", err)
+		return
+	}
+	b.log.Info("quiz hub: the old wall is gone, its quiz is in the hub", "quiz", w.ID)
+}
+
+// quizPasses: commands and "!" messages are never judged.
 func quizPasses(texts []string) bool {
 	if len(texts) == 0 {
 		return false
@@ -164,38 +288,11 @@ func quizCandidate(texts []string) string {
 	return t
 }
 
-// quizHold holds an owner message while a quiz is pending (true = held, the
-// turn ends there). The first held message of each quiz gets the one nudge.
-func (b *Bot) quizHold(ctx context.Context, j job, prompt string, held pendingMsg) bool {
-	p, ok := b.pendingQuiz()
-	if !ok {
-		return false
-	}
-	if err := appendPending(b.quizHeldFile(), held); err != nil {
-		b.log.Error("quiz: could not hold the message, answering it", "err", err)
-		return false
-	}
-	b.quizHeld.Store(true)
-	b.log.Info("quiz: message held until the quiz is solved", "quiz", p.ID)
-	if !p.Nudged {
-		p.Nudged = true
-		if err := b.setQuiz(&p); err != nil {
-			b.log.Warn("quiz: could not save the nudge", "err", err)
-		}
-		b.send(ctx, j.chatID, "🧩 Solve the quiz first: "+p.URL+" (start with ! to skip)")
-	}
-	b.mirror(ctx, j, prompt, "🧩 (held until the quiz is solved)")
-	return true
-}
-
 // startQuiz judges text in the background. One at a time: nothing starts while
-// a quiz is pending or being made (then nil: no verdict, nothing to wait for).
+// another quiz is being made (then nil: no verdict, nothing to wait for).
 // Clean English gets its praise through the slot (quizpraise.go); a mistake
 // breaks the streak, whether its quiz goes out or the checker threw it away.
 func (b *Bot) startQuiz(chatID int64, text string) *praiseSlot {
-	if _, ok := b.pendingQuiz(); ok {
-		return nil
-	}
 	spanish := looksSpanish(text)
 	if spanish && b.set.Get().GateSpanishOff {
 		return nil
@@ -240,26 +337,26 @@ func (b *Bot) startQuiz(chatID int64, text string) *praiseSlot {
 	return slot
 }
 
-// postQuiz publishes a valid quiz and puts the wall up — unless the gate went
-// off or another quiz got there first while this one was being made.
+// postQuiz publishes a valid quiz and adds it to the hub (unless the gate went
+// off while it was being made). Only the first one to do gets a message.
 func (b *Bot) postQuiz(ctx context.Context, chatID int64, q quiz) {
 	if !b.quizOn() {
 		return
 	}
-	if _, ok := b.pendingQuiz(); ok {
-		return
-	}
+	q.Hub = true
 	if err := writeQuiz(b.quizFile(q.ID), q); err != nil {
-		b.log.Error("quiz: could not publish it, no wall", "err", err)
+		b.log.Error("quiz: could not publish it", "err", err)
 		return
 	}
-	p := quizPending{ID: q.ID, URL: b.quizURL(q.ID), Title: q.Rule.Title, Created: q.Created, ChatID: chatID}
-	if err := b.setQuiz(&p); err != nil {
-		b.log.Error("quiz: could not save the wall, no wall", "err", err)
+	first, err := b.hubAdd(hubEntry{ID: q.ID, Title: q.Rule.Title, Kind: q.Kind, Created: q.Created})
+	if err != nil {
+		b.log.Error("quiz: published, but could not add it to the hub", "quiz", q.ID, "err", err)
 		return
 	}
-	b.log.Info("quiz: wall up", "quiz", q.ID, "kind", q.Kind, "rule", q.Rule.Title)
-	b.send(ctx, chatID, "🧩 Quick quiz before my next answer: "+p.URL+"\n📌 "+q.Rule.Title)
+	b.log.Info("quiz: added to the hub", "quiz", q.ID, "kind", q.Kind, "rule", q.Rule.Title, "told", first)
+	if first {
+		b.send(ctx, chatID, "🧩 New quiz in your hub: "+b.hubURL()+" — 📌 "+q.Rule.Title)
+	}
 }
 
 func writeQuiz(path string, q quiz) error {
@@ -477,11 +574,13 @@ func quizPrompt(text string, spanish bool, recent []string) string {
 	return s
 }
 
-// --- the loop: solved? → wall down → held messages answered -------------------
+// --- the loop: the old wall's messages ------------------------------------
 
-// quizLoop checks the pending quiz every quizEvery until ctx ends. Nothing is
-// read from disk unless a quiz is pending or messages are held.
+// quizLoop sets the hub up once (hubInit), then every quizEvery answers what
+// the old wall left queued, if anything. Nothing is read from disk unless
+// there is such a queue.
 func (b *Bot) quizLoop(ctx context.Context) {
+	b.hubInit()
 	t := time.NewTicker(quizEvery)
 	defer t.Stop()
 	for {
@@ -494,40 +593,20 @@ func (b *Bot) quizLoop(ctx context.Context) {
 	}
 }
 
-func (b *Bot) quizTick() {
-	if p, ok := b.pendingQuiz(); ok {
-		_, serr := os.Stat(b.solvedFile(p.ID))
-		_, qerr := os.Stat(b.quizFile(p.ID))
-		switch {
-		case serr == nil:
-			b.log.Info("quiz: solved — wall down", "quiz", p.ID)
-		case os.IsNotExist(qerr):
-			b.log.Warn("quiz: its page is gone, nobody can solve it — wall down", "quiz", p.ID)
-		default:
-			return
-		}
-		if err := b.setQuiz(nil); err != nil {
-			b.log.Error("quiz: could not take the wall down", "err", err)
-			return
-		}
-	}
-	b.releaseHeld()
-}
+func (b *Bot) quizTick() { b.releaseWallQueue() }
 
-// releaseHeld queues the turn that answers the held messages. quizReleased
-// keeps a slow turn from getting a second copy queued behind it; quizRetryAt
-// keeps a turn that failed (the queue stays) from coming back every tick.
-func (b *Bot) releaseHeld() {
-	if !b.quizHeld.Load() || b.quizReleased.Load() || b.paused() || time.Now().UnixNano() < b.quizRetryAt.Load() {
+// releaseWallQueue queues the turn that answers the old wall's queue
+// (<state>/quiz-held.jsonl). quizReleased keeps a slow turn from getting a
+// second copy queued behind it; quizRetryAt keeps a turn that failed (the
+// queue stays) from coming back every tick. Paused: it waits for /start.
+func (b *Bot) releaseWallQueue() {
+	if !b.wallQueued.Load() || b.quizReleased.Load() || b.paused() || time.Now().UnixNano() < b.quizRetryAt.Load() {
 		return
 	}
-	if _, ok := b.pendingQuiz(); ok {
-		return
-	}
-	msgs, err := readPending(b.quizHeldFile())
+	msgs, err := readPending(b.wallQueueFile())
 	if err != nil || len(msgs) == 0 {
 		if err == nil {
-			b.quizHeld.Store(false)
+			b.wallQueued.Store(false)
 		}
 		return
 	}
@@ -535,16 +614,16 @@ func (b *Bot) releaseHeld() {
 	b.quizReleased.Store(true)
 	b.quizRetryAt.Store(time.Now().Add(quizRetry).UnixNano())
 	select {
-	case b.jobs <- job{chatID: chat, isQuizRelease: true, label: "🧩 messages held during the quiz"}:
-		b.log.Info("quiz: answering the held messages", "n", len(msgs))
+	case b.jobs <- job{chatID: chat, isQuizRelease: true, label: "🧩 messages from before the quiz hub"}:
+		b.log.Info("quiz hub: answering the old wall's messages", "n", len(msgs))
 	default:
 		b.quizReleased.Store(false) // queue full; next tick
 		b.quizRetryAt.Store(0)
 	}
 }
 
-// heldQuizText is what the released messages give the next quiz.
-func heldQuizText(msgs []pendingMsg) string {
+// wallQueueQuizText is what the old wall's messages give the next quiz.
+func wallQueueQuizText(msgs []pendingMsg) string {
 	var parts []string
 	for _, m := range msgs {
 		if len(m.Transcripts) > 0 || quizPasses([]string{m.Text}) {
@@ -557,10 +636,10 @@ func heldQuizText(msgs []pendingMsg) string {
 	return quizCandidate(parts)
 }
 
-// quizHeldPrompt bundles the held messages into one turn.
-func quizHeldPrompt(msgs []pendingMsg) string {
+// wallQueuePrompt bundles the old wall's messages into one turn.
+func wallQueuePrompt(msgs []pendingMsg) string {
 	var sb strings.Builder
-	sb.WriteString("[He just solved the English quiz. These messages were held until he did (CDMX times):\n")
+	sb.WriteString("[These messages waited behind the old English quiz wall, which is gone now (quizzes stack in a hub he does whenever he wants). They were never answered (CDMX times):\n")
 	for _, m := range msgs {
 		fmt.Fprintf(&sb, "\n• %s — %s:", m.At, m.From)
 		if m.Text != "" {
@@ -577,18 +656,8 @@ func quizHeldPrompt(msgs []pendingMsg) string {
 	return sb.String()
 }
 
-// gateOff is /gate off: the setting, the wall and the held messages.
-func (b *Bot) gateOff() (int, error) {
-	if err := b.set.SetGate(false); err != nil {
-		return 0, err
-	}
-	if err := b.setQuiz(nil); err != nil {
-		return 0, err
-	}
-	msgs, _ := readPending(b.quizHeldFile())
-	b.releaseHeld()
-	return len(msgs), nil
-}
+// gateOff is /gate off: no new quizzes. The hub stays as it is.
+func (b *Bot) gateOff() error { return b.set.SetGate(false) }
 
 // gateText is /gate with no argument.
 func (b *Bot) gateText() string {
@@ -604,11 +673,13 @@ func (b *Bot) gateText() string {
 		es = "off"
 	}
 	s := "🇬🇧 English gate: " + state + " · Spanish quizzes: " + es
-	if p, ok := b.pendingQuiz(); ok {
-		s += "\n🧩 Pending quiz: " + p.URL
+	if n, err := b.hubToDo(); err != nil {
+		s += "\n⚠️ Quiz hub: " + err.Error()
+	} else {
+		s += fmt.Sprintf("\n🧩 Quiz hub: %d to do — %s", n, b.hubURL())
 	}
-	if msgs, _ := readPending(b.quizHeldFile()); len(msgs) > 0 {
-		s += fmt.Sprintf("\n📥 %d message(s) waiting for it", len(msgs))
+	if msgs, _ := readPending(b.wallQueueFile()); len(msgs) > 0 {
+		s += fmt.Sprintf("\n📥 %d message(s) from before the hub, being answered", len(msgs))
 	}
 	s += "\n" + b.streakText()
 	return s + "\nUsage: /gate on|off · /gate spanish on|off"
@@ -708,17 +779,12 @@ func (b *Bot) handleGate(ctx context.Context, chatID int64, fields []string) {
 			b.send(ctx, chatID, "⚠️ "+err.Error())
 			return
 		}
-		b.send(ctx, chatID, "🇬🇧 English gate ON (quiz mode): I always answer. Clean English gets a quick ✅ first (and a 🔥 streak); when your English has a mistake — or you write in Spanish — I send you a quick quiz (3 puzzles), and my next answer waits until you solve it. Start a message with ! to skip. /gate off to turn it off.")
+		b.send(ctx, chatID, "🇬🇧 English gate ON (quiz hub): I always answer, nothing waits. Clean English gets a quick ✅ first (and a 🔥 streak); when your English has a mistake — or you write in Spanish — a quick quiz (3 puzzles) lands in your hub: "+b.hubURL()+" — do them whenever you want. /gate off to turn it off.")
 	default:
-		n, err := b.gateOff()
-		if err != nil {
+		if err := b.gateOff(); err != nil {
 			b.send(ctx, chatID, "⚠️ "+err.Error())
 			return
 		}
-		msg := "✅ English gate OFF"
-		if n > 0 {
-			msg += fmt.Sprintf(" — answering the %d message(s) the quiz was holding.", n)
-		}
-		b.send(ctx, chatID, msg)
+		b.send(ctx, chatID, "✅ English gate OFF — no new quizzes. Your hub stays: "+b.hubURL())
 	}
 }

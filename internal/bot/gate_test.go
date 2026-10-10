@@ -46,16 +46,16 @@ func TestLooksSpanish(t *testing.T) {
 	}
 }
 
-// Commands and "!" always pass the quiz wall; nothing else does.
+// Commands and "!" are never judged; everything else may be.
 func TestQuizPasses(t *testing.T) {
 	for _, s := range []string{"! esto es urgente, contéstame en español", "/gate off", "  /stop"} {
 		if !quizPasses([]string{s}) {
-			t.Errorf("must pass the wall: %q", s)
+			t.Errorf("must not be judged: %q", s)
 		}
 	}
 	for _, s := range []string{"oye wey cómo va todo", "ok", "what we have in r2?"} {
 		if quizPasses([]string{s}) {
-			t.Errorf("must not pass the wall: %q", s)
+			t.Errorf("must be judged: %q", s)
 		}
 	}
 	if quizPasses(nil) {

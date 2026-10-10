@@ -6,13 +6,14 @@ import (
 )
 
 // Language detection for the English gate (/gate on). The gate itself — the
-// quiz wall — lives in quiz.go; this file only tells Spanish from English, so a
+// quiz hub — lives in quiz.go; this file only tells Spanish from English, so a
 // Spanish message gets a "Say it in English" quiz instead of a grammar one.
 //
 // The first gate (2-oct-2026) bounced Spanish with its English version and a
 // Gemma 4 coach bounced typed English with a major mistake (13b6289, 077e226,
 // faa6504's praise). rafiña had it removed on 7/8-oct ("delete the blocker") and
-// asked for the quiz wall instead on 9-oct.
+// asked for the quiz wall instead on 9-oct, and on 10-oct for no wall at all:
+// the quizzes stack in a hub he does whenever he wants.
 
 const gateMinWords = 3
 

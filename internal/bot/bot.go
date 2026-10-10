@@ -56,7 +56,7 @@ Commands:
 /effort <low|medium|high|xhigh|max> — set reasoning effort (persists)
 /idioma <es|en> — force Spanish replies, or back to the soul's English default (persists)
 /connectors <on|off> — load the claude.ai connectors (Higgsfield MCP, Drive, Gmail…), lazyweb and their skills in my sessions (off by default on Zoro: ~8.5K tokens per call)
-/gate <on|off> — English gate: a mistake (or Spanish) gets a 3-puzzle quiz link; my next answer waits until you solve it (start with ! to skip; /gate spanish on|off)
+/gate <on|off> — English gate: a mistake (or Spanish) gets a 3-puzzle quiz in your hub (coach.dominioartificial.com), nothing waits; /gate shows how many are to do (/gate spanish on|off)
 /voice <msg> — reply with a voice note
 /btw <question> — side-question in parallel on Opus (researches freely, won't touch this chat)
 /crons — list scheduled messages (and next run)
@@ -123,13 +123,11 @@ type Bot struct {
 	// ok=false with no error = clean English, praise its line (quizpraise.go).
 	// A field so tests can stand in.
 	makeQuiz func(ctx context.Context, text string, spanish bool) (q quiz, ok bool, praise string, err error)
-	// English gate, quiz mode (quiz.go): the pending quiz (nil = no wall), loaded
-	// from <state>/quiz.json once; whether messages are held; one quiz made at a
-	// time; whether the release turn is queued; quizWG waits for quizzes in flight.
+	// English gate, quiz hub (quiz.go): quizMu guards <QuizDir>/hub.json; whether
+	// the old wall left messages queued; one quiz made at a time; whether the
+	// turn that answers that queue is queued; quizWG waits for quizzes in flight.
 	quizMu       sync.Mutex
-	quizCur      *quizPending
-	quizLoaded   bool
-	quizHeld     atomic.Bool
+	wallQueued   atomic.Bool
 	quizBusy     atomic.Bool
 	quizReleased atomic.Bool
 	quizRetryAt  atomic.Int64 // unix ns: no new release turn before this (a failed one waits)
@@ -158,7 +156,7 @@ type job struct {
 	isRollover bool
 	// isPending: the resume turn that bundles the messages saved during a pause.
 	isPending bool
-	// isQuizRelease: the turn that answers the messages held behind a quiz (quiz.go).
+	// isQuizRelease: the turn that answers what the old quiz wall left queued (quiz.go).
 	isQuizRelease bool
 	// isSide: a cron that runs in a fresh throwaway session, not the main one
 	// (digest.go); cronID names it in the digest.
@@ -240,7 +238,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	go b.pauseLoop(ctx)
 	// Outbox watcher: delivers what detached jobs drop between turns.
 	go b.outboxLoop(ctx)
-	// English gate, quiz mode: notices a solved quiz and releases the held messages.
+	// English gate, quiz hub: builds hub.json if missing, migrates an old wall.
 	go b.quizLoop(ctx)
 
 	b.log.Info("zoro online",
@@ -596,20 +594,20 @@ func (b *Bot) process(parent context.Context, j job) {
 		}
 		prompt, pendingN = pendingPrompt(msgs), len(msgs)
 	}
-	heldN := 0     // quiz release turn: how many held messages it carries
+	wallN := 0     // quiz release turn: how many of the old wall's messages it carries
 	quizText := "" // what the English quiz judges, in parallel with the answer
 	if j.isQuizRelease {
 		defer b.quizReleased.Store(false)
 		if b.paused() {
-			return // the held messages wait for /start
+			return // the old wall's messages wait for /start
 		}
-		msgs, _ := readPending(b.quizHeldFile())
+		msgs, _ := readPending(b.wallQueueFile())
 		if len(msgs) == 0 {
 			return
 		}
-		prompt, heldN = quizHeldPrompt(msgs), len(msgs)
+		prompt, wallN = wallQueuePrompt(msgs), len(msgs)
 		if b.quizOn() {
-			quizText = heldQuizText(msgs)
+			quizText = wallQueueQuizText(msgs)
 		}
 	}
 	if len(j.msgs) > 0 {
@@ -650,15 +648,12 @@ func (b *Bot) process(parent context.Context, j job) {
 		return
 	}
 
-	// English gate, quiz mode (quiz.go): while a quiz is pending the owner's
-	// message is held for later; otherwise his typed English may get a quiz, made
-	// in parallel — the answer waits only for a clean verdict's praise, at most
-	// praiseWait. Commands and "!" always pass.
+	// English gate, quiz hub (quiz.go): the owner's message never waits for a
+	// quiz. His typed English may get one for the hub, made in parallel — the
+	// answer waits only for a clean verdict's praise, at most praiseWait.
+	// Commands and "!" are never judged.
 	if isOwner && len(j.msgs) > 0 && j.msgs[0].From != nil && j.msgs[0].From.ID == b.cfg.OwnerID &&
 		b.quizOn() && !quizPasses(texts) {
-		if b.quizHold(parent, j, prompt, held) {
-			return
-		}
 		quizText = quizCandidate(texts)
 	}
 	// A clean verdict's praise goes out before the answer (quizpraise.go).
@@ -829,9 +824,9 @@ func (b *Bot) process(parent context.Context, j job) {
 		}
 	}
 	b.log.Info("turn done", "job", j.label, "input_tokens", res.Usage.Input(), "output_tokens", res.Usage.OutputTokens)
-	if heldN > 0 {
-		if err := consumeQueue(b.quizHeldFile(), heldN); err != nil {
-			b.log.Warn("quiz: could not clear the held messages", "err", err)
+	if wallN > 0 {
+		if err := consumeQueue(b.wallQueueFile(), wallN); err != nil {
+			b.log.Warn("quiz hub: could not clear the old wall's messages", "err", err)
 		}
 		b.quizRetryAt.Store(0)
 	}

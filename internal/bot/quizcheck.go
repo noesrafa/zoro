@@ -26,6 +26,9 @@ type quiz struct {
 	Original  string       `json:"original"`
 	Corrected string       `json:"corrected"`
 	Puzzles   []quizPuzzle `json:"puzzles"`
+	// Hub: made by the hub engine (10-oct) — the page drops the old wall's
+	// "Zoro answers your next message" line. Set when it is published.
+	Hub bool `json:"hub,omitempty"`
 }
 
 type quizRule struct {
@@ -200,7 +203,7 @@ func sameWords(a, b string) bool {
 }
 
 // validateQuiz rejects a quiz the page can't run or that has no single right
-// answer it can check. A rejected quiz is never shown: no quiz, no wall.
+// answer it can check. A rejected quiz is never shown: no quiz at all.
 func validateQuiz(q quiz) error {
 	var errs []string
 	bad := func(f string, a ...any) { errs = append(errs, fmt.Sprintf(f, a...)) }
@@ -381,7 +384,7 @@ type quizVerdict struct {
 // parseQuizVerdict reads the model's FIRST JSON object, tolerating ```json
 // fences and chatter around it. First, not last: when the model second-guesses
 // itself ({"clean": true} … "Wait, actually" {…quiz…}) the first call stands —
-// a needless wall costs more than a missed quiz.
+// a needless quiz costs more than a missed one.
 func parseQuizVerdict(content string) (quizVerdict, error) {
 	var v quizVerdict
 	i := strings.Index(content, "{")

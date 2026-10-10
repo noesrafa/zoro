@@ -151,7 +151,7 @@ func readPending(path string) ([]pendingMsg, error) {
 func (b *Bot) consumePending(n int) error { return consumeQueue(b.pendingFile(), n) }
 
 // consumeQueue drops the first n lines of a message queue (pending.jsonl, or the
-// quiz's quiz-held.jsonl); the file goes away once it's empty.
+// old quiz wall's quiz-held.jsonl); the file goes away once it's empty.
 func consumeQueue(path string, n int) error {
 	msgs, err := readPending(path)
 	if err != nil {
