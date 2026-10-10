@@ -37,7 +37,7 @@ func (b *Bot) deZoroTick() {
 		b.log.Info("de-zoro: message from Zoro", "chars", len(text))
 		b.enqueue(job{
 			chatID: b.cfg.OwnerID,
-			prompt: "[📨 Mensaje directo de Zoro (el agente de rafiña). No es de tu dueña/dueño: atiéndelo y, si te pide avisarle algo, avísale en tu respuesta.]\n\n" + text,
+			prompt: "[📨 Mensaje directo de Zoro (el agente de rafiña). No es de tu dueña/dueño. Tu respuesta le llega a ELLA/ÉL, no a Zoro: escríbela sólo para tu dueño, sin notas para Zoro.]\n\n" + text,
 			label:  "📨 de Zoro",
 		})
 	}
