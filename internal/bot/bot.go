@@ -240,6 +240,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	go b.outboxLoop(ctx)
 	// English gate, quiz hub: builds hub.json if missing, migrates an old wall.
 	go b.quizLoop(ctx)
+	go b.deZoroLoop(ctx)
 
 	b.log.Info("zoro online",
 		"owner", b.cfg.OwnerID, "workdir", b.cfg.WorkDir, "model", b.cfg.ClaudeModel,
