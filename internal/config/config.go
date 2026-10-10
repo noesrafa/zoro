@@ -57,6 +57,9 @@ type Config struct {
 
 	// NightlyAt is when the engine's built-in close-the-day runs ("HH:MM" local,
 	// "off" to disable); NightlyPromptFile holds the agent's own instructions for it.
+	// UpstreamBin is Zoro's build that a sub-agent's /redeploy installs over its own binary.
+	UpstreamBin string
+
 	NightlyAt         string
 	NightlyPromptFile string
 
@@ -147,6 +150,7 @@ func Load() (Config, error) {
 	c.ContextFile = getenv("ZORO_CONTEXT_FILE", filepath.Join(c.ZoroHome, "context.md"))
 	c.CronFile = getenv("ZORO_CRON_FILE", filepath.Join(c.ZoroHome, "crons.json"))
 	c.NightlyAt = getenv("ZORO_NIGHTLY_AT", "01:00")
+	c.UpstreamBin = getenv("ZORO_UPSTREAM_BIN", "/home/rafael/zoro/bin/zoro")
 	c.NightlyPromptFile = getenv("ZORO_NIGHTLY_PROMPT_FILE", filepath.Join(c.ZoroHome, "cierre.md"))
 
 	// TELEGRAM_OWNER_ID admite varios IDs separados por coma. El primero es el

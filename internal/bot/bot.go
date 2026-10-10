@@ -396,10 +396,20 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 				_ = os.Remove(b.aliveFile) // clean marker so next start isn't reported as a crash
 				os.Exit(0)
 			}()
-		case "/redeploy":
-			go b.redeploy(m.Chat.ID)
-		case "/update":
-			go b.update(m.Chat.ID)
+		case "/redeploy", "/update":
+			if b.cfg.AgentName != "zoro" {
+				if b.busy.Load() {
+					b.send(ctx, m.Chat.ID, "⏳ Hay un turno corriendo. Usa /cancel primero o espera a que termine.")
+					return
+				}
+				go b.subRedeploy(m.Chat.ID)
+				return
+			}
+			if cmd == "/update" {
+				go b.update(m.Chat.ID)
+			} else {
+				go b.redeploy(m.Chat.ID)
+			}
 		case "/compact":
 			b.enqueue(job{chatID: m.Chat.ID, prompt: "/compact", isCompact: true})
 		case "/model":
@@ -1294,13 +1304,27 @@ func (b *Bot) registerCommands(ctx context.Context) {
 		{Command: "start", Description: "▶️ Un-pause all agents, pick up saved messages"},
 		{Command: "auth", Description: "Backend: /auth sub | /auth mimo"},
 	}
-	// Sub-agents (sky, tequila…) share this engine but not rafiña's personal
-	// commands: /coche, /percance, /redeploy, /revivir only make sense on Zoro.
+	// Sub-agents (sky, tequila, rinzler…) share this engine. rafiña, 10-oct-2026:
+	// "I said the same as Zoro and I can't see all the commands" → they get every
+	// command that works for them; only rafiña's personal ones (/coche,
+	// /percance) and the ones that drive OTHER agents (/revivir, /stop, /start,
+	// /auth, /gate) stay on Zoro. Their /redeploy installs Zoro's build (subRedeploy).
 	if b.cfg.AgentName != "zoro" {
 		cmds = []tg.BotCommand{
 			{Command: "newsession", Description: "Empezar una conversación nueva"},
+			{Command: "redeploy", Description: "Actualizar al engine más nuevo + reiniciar"},
 			{Command: "btw", Description: "Pregunta rápida en paralelo: /btw <pregunta>"},
+			{Command: "model", Description: "Cambiar modelo (opus/sonnet/haiku/…)"},
+			{Command: "effort", Description: "Esfuerzo: /effort low|medium|high"},
 			{Command: "tasks", Description: "Ver tareas"},
+			{Command: "focus", Description: "Sesión nueva dentro de un proyecto: /focus <nombre|off>"},
+			{Command: "idioma", Description: "Cambiar idioma: /idioma es|en"},
+			{Command: "crons", Description: "Ver y disparar crons"},
+			{Command: "compact", Description: "Compactar la conversación"},
+			{Command: "cancel", Description: "Cancelar el turno en curso"},
+			{Command: "restart", Description: "Reiniciarme"},
+			{Command: "status", Description: "Estado: modelo, costo, uptime"},
+			{Command: "help", Description: "Todos los comandos"},
 		}
 	}
 	if err := b.tg.SetMyCommands(ctx, cmds); err != nil {
