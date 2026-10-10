@@ -262,7 +262,7 @@ func writeQuiz(path string, q quiz) error {
 // wrong rule) and applyCheck fixes what it can. A quiz the validator or the
 // checker rejects gets ONE retry that is told why; a second rejection = no quiz.
 func (b *Bot) generateQuiz(ctx context.Context, text string, spanish bool) (quiz, bool, error) {
-	opts := claude.RunOpts{Model: "sonnet", Effort: "low", SystemPrompt: quizSystem, Auth: b.set.Get().Auth}
+	opts := claude.RunOpts{Model: "sonnet", Effort: "low", SystemPrompt: quizSystem, Auth: b.set.Get().Auth, Bare: true}
 	prompt := quizPrompt(text, spanish)
 	var last error
 	for try := 0; try < 2; try++ {
@@ -304,7 +304,7 @@ type quizCheck struct {
 // checkQuiz runs the checker on a valid quiz and applies it. If the checker
 // itself fails (call or JSON), the validated quiz stands.
 func (b *Bot) checkQuiz(ctx context.Context, q *quiz) error {
-	opts := claude.RunOpts{Model: "sonnet", Effort: "low", SystemPrompt: quizCheckSystem, Auth: b.set.Get().Auth}
+	opts := claude.RunOpts{Model: "sonnet", Effort: "low", SystemPrompt: quizCheckSystem, Auth: b.set.Get().Auth, Bare: true}
 	res, err := b.run(ctx, uid.New(), true, quizCheckPrompt(*q), opts)
 	if err != nil {
 		b.log.Warn("quiz: checker failed, keeping the validated quiz", "err", truncate(err.Error(), 200))
@@ -552,7 +552,7 @@ STEP 1 — decide.
   4. A missing "is"/"are" ("it still working" → "it's still working", "How's going" → "How's it going").
   5. Adjective order, double negatives ("I don't like nothing" → "I don't like anything"), wrong prepositions.
 - Otherwise → {"clean": true}.
-NEVER errors: typos and misspellings (analize, cuota, englihs, downoload — a quiz is never about a typo), capital letters, punctuation and commas, missing apostrophes (dont, its, cant, lets), a missing question mark, texting style (u, pls, bro, man, haha), slang, short chat fragments ("thanks, send me the ref", "yes do it"), imperatives, a missing article or plural -s (small slips), brand/product/tech names, numbers, Spanish names of people, places or things. When in doubt, it is clean.
+NEVER errors: typos and misspellings (analize, cuota, englihs, downoload — a quiz is never about a typo), capital letters, punctuation and commas, missing apostrophes (dont, its, cant, lets), a missing question mark, texting style (u, pls, bro, man, haha), slang, short chat fragments ("thanks, send me the ref", "yes do it"), imperatives, a missing article or plural -s (small slips), a dropped "it" in a quick command ("test that works"), a word that is only less precise ("in case" for "if"), brand/product/tech names, numbers, Spanish names of people, places or things. When in doubt, it is clean: quiz only an error you are SURE a native speaker would correct — most of his messages are clean.
 Decide BEFORE you write: write exactly ONE JSON object, once, and never a second one after it.
 
 STEP 2 — only if not clean, the quiz. Simple English a B1 learner reads in 5 seconds:

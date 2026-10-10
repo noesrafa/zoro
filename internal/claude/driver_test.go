@@ -61,3 +61,33 @@ func TestDiagnosticJoinsTextAndErrors(t *testing.T) {
 		t.Errorf("empty Result should have an empty diagnostic, got %q", got)
 	}
 }
+
+// A bare one-shot (the quiz) REPLACES Claude Code's system prompt and loads
+// nothing else; a normal turn only appends the soul.
+func TestArgsBare(t *testing.T) {
+	d := New(Config{Model: "opus"})
+	has := func(a []string, s string) bool {
+		for _, x := range a {
+			if x == s {
+				return true
+			}
+		}
+		return false
+	}
+	bare := d.args("sid", true, "hi", RunOpts{SystemPrompt: "coach", Bare: true})
+	for _, f := range []string{"--system-prompt", "--tools", "--strict-mcp-config", "--disable-slash-commands", "--setting-sources", "--no-session-persistence"} {
+		if !has(bare, f) {
+			t.Errorf("bare args miss %s: %q", f, bare)
+		}
+	}
+	if has(bare, "--append-system-prompt") {
+		t.Errorf("bare must replace the system prompt, not append: %q", bare)
+	}
+	normal := d.args("sid", false, "hi", RunOpts{SystemPrompt: "soul"})
+	if !has(normal, "--append-system-prompt") || has(normal, "--system-prompt") || has(normal, "--tools") || has(normal, "--no-session-persistence") {
+		t.Errorf("a normal turn keeps Claude Code's prompt and tools: %q", normal)
+	}
+	if normal[len(normal)-1] != "hi" || bare[len(bare)-1] != "hi" {
+		t.Error("the prompt must stay the last argument")
+	}
+}

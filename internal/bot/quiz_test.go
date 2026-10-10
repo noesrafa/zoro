@@ -577,3 +577,28 @@ func TestQuizReleaseFailureBacksOff(t *testing.T) {
 		t.Fatal("after the wait the release runs and clears the queue")
 	}
 }
+
+// Both quiz calls run bare (their own system prompt, no tools/MCP/skills): the
+// job needs ~2K tokens, Claude Code's defaults cost ~28K per call.
+func TestQuizCallsAreBare(t *testing.T) {
+	tb, _ := quizBot(t)
+	var opts []claude.RunOpts
+	tb.run = func(_ context.Context, sid string, _ bool, p string, o claude.RunOpts) (claude.Result, error) {
+		opts = append(opts, o)
+		if strings.HasPrefix(p, "Quiz to check") {
+			return claude.Result{Text: checkOK}, nil
+		}
+		return claude.Result{Text: modelQuizJSON}, nil
+	}
+	if _, ok, err := tb.generateQuiz(context.Background(), "what we have in r2?", false); err != nil || !ok {
+		t.Fatalf("quiz: ok=%v err=%v", ok, err)
+	}
+	if len(opts) != 2 {
+		t.Fatalf("maker + checker = 2 calls, got %d", len(opts))
+	}
+	for i, o := range opts {
+		if !o.Bare || o.SystemPrompt == "" {
+			t.Errorf("call %d must be bare with its own system prompt: %+v", i, o)
+		}
+	}
+}

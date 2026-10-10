@@ -47,7 +47,20 @@ type Result struct {
 	// when the API call itself failed ("rate_limit", "authentication_failed"…).
 	// A real model reply never carries it.
 	APIError string
+	Usage    Usage // what the turn read and wrote, summed over its API calls (from the result event)
 }
+
+// Usage is the token count the CLI reports for a turn. Input is everything the
+// model read: fresh + cache writes + cache reads.
+type Usage struct {
+	InputTokens         int `json:"input_tokens"`
+	CacheCreationTokens int `json:"cache_creation_input_tokens"`
+	CacheReadTokens     int `json:"cache_read_input_tokens"`
+	OutputTokens        int `json:"output_tokens"`
+}
+
+// Input is every input token of the turn, cached or not.
+func (u Usage) Input() int { return u.InputTokens + u.CacheCreationTokens + u.CacheReadTokens }
 
 // FailureKind classifies WHY a turn failed, read from the CLI's own output.
 // Needed because the most important failure — the OAuth session dying — exits 1
@@ -131,6 +144,10 @@ type RunOpts struct {
 	SystemPrompt string // overrides cfg.SystemPrompt; read fresh each turn for hot-reload
 	WorkDir      string // overrides cfg.WorkDir (/focus) — MUST stay constant within a session
 	Auth         string // "" = Claude subscription (OAuth), AuthMiMo = MiMo Token Plan
+	// Bare is a one-shot text job (the English quiz): SystemPrompt REPLACES
+	// Claude Code's own, and no tools, MCP servers, skills, settings files
+	// (CLAUDE.md, hooks) or transcript. ~0.9K tokens of input instead of ~26K.
+	Bare bool
 }
 
 type Driver struct{ cfg Config }
@@ -149,7 +166,11 @@ func (d *Driver) args(sessionID string, create bool, prompt string, o RunOpts) [
 	if o.Effort != "" {
 		a = append(a, "--effort", o.Effort)
 	}
-	if o.SystemPrompt != "" {
+	switch {
+	case o.Bare:
+		a = append(a, "--system-prompt", o.SystemPrompt, "--tools", "", "--strict-mcp-config",
+			"--disable-slash-commands", "--setting-sources", "", "--no-session-persistence")
+	case o.SystemPrompt != "":
 		a = append(a, "--append-system-prompt", o.SystemPrompt)
 	}
 	if d.cfg.DangerSkip {
@@ -173,6 +194,7 @@ type event struct {
 	NumTurns     int             `json:"num_turns"`
 	IsError      bool            `json:"is_error"`
 	Errors       []string        `json:"errors"`
+	Usage        *Usage          `json:"usage"`
 	Message      json.RawMessage `json:"message"`
 	// Raw on purpose: only assistant events carry it as a string, and a typed
 	// field would make any other event with an object "error" fail to decode.
@@ -241,6 +263,9 @@ func (d *Driver) Run(ctx context.Context, sessionID string, create bool, prompt 
 			res.CostUSD = ev.TotalCostUSD
 			res.NumTurns = ev.NumTurns
 			res.Errors = ev.Errors
+			if ev.Usage != nil {
+				res.Usage = *ev.Usage
+			}
 			if ev.SessionID != "" {
 				res.SessionID = ev.SessionID
 			}

@@ -7,6 +7,8 @@ package bot
 //
 // cases.tsv: "<label>\t<message>" per line (label: error | clean | spanish).
 // The environment picks the Claude login (CLAUDE_CONFIG_DIR, …), as for the engine.
+// Every call's input tokens are recorded; ZORO_QUIZ_EVAL_FULL=1 runs the calls
+// the old way (Claude Code's full system prompt, tools, MCP, skills) to compare.
 
 import (
 	"bufio"
@@ -30,6 +32,7 @@ type quizEvalRow struct {
 	Result  string  `json:"result"` // quiz | clean | rejected | error | skipped
 	Err     string  `json:"err,omitempty"`
 	Calls   int     `json:"calls"`
+	Tokens  []int   `json:"tokens"` // input tokens of each call
 	Seconds float64 `json:"seconds"`
 	Quiz    *quiz   `json:"quiz,omitempty"`
 	Log     string  `json:"log,omitempty"` // the engine's log lines (rejections)
@@ -59,6 +62,7 @@ func TestQuizEval(t *testing.T) {
 		bin = "/home/rafael/.local/bin/claude"
 	}
 	driver := claude.New(claude.Config{Bin: bin, WorkDir: "/home/rafael", DangerSkip: true})
+	full := os.Getenv("ZORO_QUIZ_EVAL_FULL") == "1"
 	workers := 3
 	sem := make(chan struct{}, workers)
 	var wg sync.WaitGroup
@@ -74,10 +78,15 @@ func TestQuizEval(t *testing.T) {
 			defer func() { r.Log = logBuf.String() }()
 			var mu sync.Mutex
 			tb.run = func(ctx context.Context, sid string, create bool, prompt string, o claude.RunOpts) (claude.Result, error) {
+				if full {
+					o.Bare = false
+				}
+				res, err := driver.Run(ctx, sid, create, prompt, o)
 				mu.Lock()
 				r.Calls++
+				r.Tokens = append(r.Tokens, res.Usage.Input())
 				mu.Unlock()
-				return driver.Run(ctx, sid, create, prompt, o)
+				return res, err
 			}
 			text := quizCandidate([]string{r.Text})
 			if text == "" {
@@ -99,7 +108,7 @@ func TestQuizEval(t *testing.T) {
 			default:
 				r.Result = "clean"
 			}
-			t.Logf("%-7s %-8s %5.1fs calls=%d  %.70s", r.Label, r.Result, r.Seconds, r.Calls, r.Text)
+			t.Logf("%-7s %-8s %5.1fs calls=%d tokens=%v  %.70s", r.Label, r.Result, r.Seconds, r.Calls, r.Tokens, r.Text)
 		}(&rows[i])
 	}
 	wg.Wait()
@@ -118,7 +127,12 @@ func TestQuizEval(t *testing.T) {
 	}
 	var secs []float64
 	n := map[string]int{}
+	calls, tokens := 0, 0
 	for _, r := range rows {
+		calls += len(r.Tokens)
+		for _, k := range r.Tokens {
+			tokens += k
+		}
 		n[r.Label+"/"+r.Result]++
 		if r.Result != "skipped" {
 			secs = append(secs, r.Seconds)
@@ -132,4 +146,7 @@ func TestQuizEval(t *testing.T) {
 		return secs[int(p*float64(len(secs)-1)+0.5)]
 	}
 	t.Logf("results: %v · latency p50 %.1fs p95 %.1fs", n, pct(0.5), pct(0.95))
+	if calls > 0 {
+		t.Logf("tokens: %d calls, %d input tokens, %d per call", calls, tokens, tokens/calls)
+	}
 }
