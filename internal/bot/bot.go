@@ -55,6 +55,7 @@ Commands:
 /model <opus|sonnet|haiku|fable|claude-…> — switch model (persists)
 /effort <low|medium|high|xhigh|max> — set reasoning effort (persists)
 /idioma <es|en> — force Spanish replies, or back to the soul's English default (persists)
+/connectors <on|off> — load the claude.ai connectors (Higgsfield MCP, Drive, Gmail…), lazyweb and their skills in my sessions (off by default on Zoro: ~8.5K tokens per call)
 /gate <on|off> — English gate: a mistake (or Spanish) gets a 3-puzzle quiz link; my next answer waits until you solve it (start with ! to skip; /gate spanish on|off)
 /voice <msg> — reply with a voice note
 /btw <question> — side-question in parallel on Opus (researches freely, won't touch this chat)
@@ -457,6 +458,8 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 			}
 		case "/gate":
 			b.handleGate(ctx, m.Chat.ID, fields)
+		case "/connectors":
+			b.handleConnectors(ctx, m, strings.ToLower(firstArg(text, fields[0])))
 		case "/voice":
 			rest := strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
 			if rest == "" {
@@ -680,7 +683,7 @@ func (b *Bot) process(parent context.Context, j job) {
 	}
 	// The session's cwd (/focus) rides along on EVERY turn — resuming from a
 	// different dir would fork the transcript.
-	opts := claude.RunOpts{Model: cur.Model, Effort: cur.Effort, SystemPrompt: b.systemPrompt(), WorkDir: st.WorkDir, Auth: cur.Auth}
+	opts := claude.RunOpts{Model: cur.Model, Effort: cur.Effort, SystemPrompt: b.systemPrompt(), WorkDir: st.WorkDir, Auth: cur.Auth, NoConnectors: !b.connectorsOn()}
 
 	// On a NEW session, prime the conversation once with the heavy context.md
 	// (durable background about rafiña). On resumes it's already in history.
@@ -1262,6 +1265,7 @@ func (b *Bot) statusText() string {
 		b.backendLine() + b.parkedNote(),
 		"workdir: " + b.cfg.WorkDir,
 		"focus: " + foco,
+		"connectors: " + onoff(b.connectorsOn()),
 		fmt.Sprintf("last turn cost: $%.4f", cost),
 		"voice in (stt): " + onoff(b.mediaC.STT.Available()),
 		"voice out (tts): " + onoff(b.tts.Available()),
@@ -1387,7 +1391,7 @@ func (b *Bot) handleBtw(m *tg.Message, question string) {
 	defer stop()
 
 	auth := b.set.Get().Auth
-	opts := claude.RunOpts{Model: "opus", Effort: "medium", SystemPrompt: b.systemPrompt(), Auth: auth}
+	opts := claude.RunOpts{Model: "opus", Effort: "medium", SystemPrompt: b.systemPrompt(), Auth: auth, NoConnectors: !b.connectorsOn()}
 	res, err := b.run(ctx, uid.New(), true, question, opts)
 	stop()
 	if err != nil && auth != claude.AuthMiMo && res.HitLimit() {

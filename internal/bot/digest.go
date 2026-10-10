@@ -125,7 +125,7 @@ func (b *Bot) clearDigest(n int) error {
 // processSide runs a cron in its own throwaway session and delivers the reply
 // like any turn. Called by process under turnMu (outbox deliveries need it).
 func (b *Bot) processSide(ctx, parent context.Context, j job, prompt string, cur settings.Settings, stopTyping func()) {
-	opts := claude.RunOpts{Model: cur.Model, Effort: cur.Effort, SystemPrompt: b.systemPrompt(), Auth: cur.Auth}
+	opts := claude.RunOpts{Model: cur.Model, Effort: cur.Effort, SystemPrompt: b.systemPrompt(), Auth: cur.Auth, NoConnectors: !b.connectorsOn()}
 	turn := b.primeWithContext(prompt)
 	res, err := b.run(ctx, uid.New(), true, turn, opts)
 	if err != nil && ctx.Err() != nil {

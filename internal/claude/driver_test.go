@@ -1,6 +1,11 @@
 package claude
 
-import "testing"
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // The strings below are VERBATIM from the CLI, captured by reproducing each
 // failure against the real binary. The auth one is the whole point of Failure():
@@ -90,4 +95,56 @@ func TestArgsBare(t *testing.T) {
 	if normal[len(normal)-1] != "hi" || bare[len(bare)-1] != "hi" {
 		t.Error("the prompt must stay the last argument")
 	}
+}
+
+// NoConnectors: no MCP server at all, and the lazyweb skills (only useful with
+// its MCP) hidden by name from the CLI's skills dir; higgsfield (CLI) stays.
+func TestArgsNoConnectors(t *testing.T) {
+	dir := t.TempDir()
+	for _, s := range []string{"lazyweb", "lazyweb-search-flows", "higgsfield-generate"} {
+		if err := os.MkdirAll(filepath.Join(dir, "skills", s), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env := []string{"CLAUDE_CONFIG_DIR=" + dir}
+	d := New(Config{})
+	a := d.argsEnv("sid", false, "hi", RunOpts{SystemPrompt: "soul", NoConnectors: true}, env)
+	i := indexOf(a, "--settings")
+	if indexOf(a, "--strict-mcp-config") < 0 || i < 0 {
+		t.Fatalf("no-connectors args: %q", a)
+	}
+	var set struct {
+		SkillOverrides map[string]string `json:"skillOverrides"`
+		EnabledPlugins map[string]bool   `json:"enabledPlugins"`
+	}
+	if err := json.Unmarshal([]byte(a[i+1]), &set); err != nil {
+		t.Fatal(err)
+	}
+	if set.SkillOverrides["lazyweb"] != "off" || set.SkillOverrides["lazyweb-search-flows"] != "off" {
+		t.Errorf("lazyweb skills must be off: %v", set.SkillOverrides)
+	}
+	if _, ok := set.SkillOverrides["higgsfield-generate"]; ok {
+		t.Errorf("higgsfield skills stay: %v", set.SkillOverrides)
+	}
+	if v, ok := set.EnabledPlugins["cowork-plugin-management@synced"]; !ok || v {
+		t.Errorf("cowork plugin off: %v", set.EnabledPlugins)
+	}
+	if a[len(a)-1] != "hi" {
+		t.Error("the prompt must stay last")
+	}
+	if on := d.argsEnv("sid", false, "hi", RunOpts{SystemPrompt: "soul"}, env); indexOf(on, "--strict-mcp-config") >= 0 || indexOf(on, "--settings") >= 0 {
+		t.Errorf("connectors on = the invocation as before: %q", on)
+	}
+	if bare := d.argsEnv("sid", true, "hi", RunOpts{SystemPrompt: "q", Bare: true, NoConnectors: true}, env); indexOf(bare, "--settings") >= 0 {
+		t.Errorf("bare already loads nothing: %q", bare)
+	}
+}
+
+func indexOf(a []string, s string) int {
+	for i, x := range a {
+		if x == s {
+			return i
+		}
+	}
+	return -1
 }

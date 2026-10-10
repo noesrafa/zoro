@@ -25,6 +25,10 @@ type Settings struct {
 	// GateSpanishOff: with the gate on, a Spanish message gets no "Say it in
 	// English" quiz (only English with mistakes does). Off = Spanish quizzes ON.
 	GateSpanishOff bool `json:"gate_spanish_off,omitempty"`
+	// Connectors (/connectors on|off): "on" loads the claude.ai connectors, the
+	// MCP servers and their skills in the agent's sessions, "off" leaves them
+	// out; "" = the agent's default (off on Zoro, on on the sub-agents).
+	Connectors string `json:"connectors,omitempty"`
 }
 
 // Store guards settings.json.
@@ -96,6 +100,14 @@ func (s *Store) SetGateSpanishOff(off bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.s.GateSpanishOff = off
+	return s.save()
+}
+
+// SetConnectors persists the connectors switch ("on", "off").
+func (s *Store) SetConnectors(v string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.s.Connectors = v
 	return s.save()
 }
 

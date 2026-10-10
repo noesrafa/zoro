@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -148,6 +149,50 @@ type RunOpts struct {
 	// Claude Code's own, and no tools, MCP servers, skills, settings files
 	// (CLAUDE.md, hooks) or transcript. ~0.9K tokens of input instead of ~26K.
 	Bare bool
+	// NoConnectors leaves out the claude.ai connectors (Higgsfield, Drive,
+	// Gmail…), every other MCP server (lazyweb) and the skills and plugins that
+	// only go with them: ~8.5K fewer input tokens on EVERY call of a session, and
+	// no mid-session re-announcements of their tool lists. /connectors on.
+	NoConnectors bool
+}
+
+// offSkillPrefixes are skills that only drive an MCP server NoConnectors drops
+// (matched by name prefix in the CLI's skills dir, so new ones are caught too);
+// offPlugins are plugins nobody uses here. The higgsfield-* skills stay: they
+// run the higgsfield CLI, not the connector.
+var (
+	offSkillPrefixes = []string{"lazyweb"}
+	offPlugins       = []string{"cowork-plugin-management@synced"}
+)
+
+// leanSettings is the --settings JSON of a NoConnectors turn: skillOverrides
+// "off" hides a skill from the model and the slash menu without deleting it.
+func leanSettings(env []string) string {
+	dir := ""
+	for _, e := range env {
+		if v, ok := strings.CutPrefix(e, "CLAUDE_CONFIG_DIR="); ok {
+			dir = v
+		}
+	}
+	if dir == "" {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, ".claude")
+	}
+	skills := map[string]string{}
+	ents, _ := os.ReadDir(filepath.Join(dir, "skills"))
+	for _, e := range ents {
+		for _, p := range offSkillPrefixes {
+			if strings.HasPrefix(e.Name(), p) {
+				skills[e.Name()] = "off"
+			}
+		}
+	}
+	plugins := map[string]bool{}
+	for _, p := range offPlugins {
+		plugins[p] = false
+	}
+	raw, _ := json.Marshal(map[string]any{"skillOverrides": skills, "enabledPlugins": plugins})
+	return string(raw)
 }
 
 type Driver struct{ cfg Config }
@@ -155,6 +200,10 @@ type Driver struct{ cfg Config }
 func New(cfg Config) *Driver { return &Driver{cfg: cfg} }
 
 func (d *Driver) args(sessionID string, create bool, prompt string, o RunOpts) []string {
+	return d.argsEnv(sessionID, create, prompt, o, os.Environ())
+}
+
+func (d *Driver) argsEnv(sessionID string, create bool, prompt string, o RunOpts, env []string) []string {
 	model := o.Model
 	if model == "" {
 		model = d.cfg.Model
@@ -172,6 +221,10 @@ func (d *Driver) args(sessionID string, create bool, prompt string, o RunOpts) [
 			"--disable-slash-commands", "--setting-sources", "", "--no-session-persistence")
 	case o.SystemPrompt != "":
 		a = append(a, "--append-system-prompt", o.SystemPrompt)
+	}
+	if o.NoConnectors && !o.Bare {
+		// --strict-mcp-config with no --mcp-config = no MCP server at all.
+		a = append(a, "--strict-mcp-config", "--settings", leanSettings(env))
 	}
 	if d.cfg.DangerSkip {
 		a = append(a, "--dangerously-skip-permissions")
@@ -207,7 +260,7 @@ func (d *Driver) Run(ctx context.Context, sessionID string, create bool, prompt 
 	if err != nil {
 		return Result{SessionID: sessionID}, err
 	}
-	cmd := exec.CommandContext(ctx, d.cfg.Bin, d.args(sessionID, create, prompt, o)...)
+	cmd := exec.CommandContext(ctx, d.cfg.Bin, d.argsEnv(sessionID, create, prompt, o, env)...)
 	cmd.Dir = d.cfg.WorkDir
 	if o.WorkDir != "" {
 		cmd.Dir = o.WorkDir
