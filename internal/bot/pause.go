@@ -148,13 +148,17 @@ func readPending(path string) ([]pendingMsg, error) {
 
 // consumePending drops the first n messages — the ones the resume turn just
 // delivered. Anything queued after them stays for the next round.
-func (b *Bot) consumePending(n int) error {
-	msgs, err := readPending(b.pendingFile())
+func (b *Bot) consumePending(n int) error { return consumeQueue(b.pendingFile(), n) }
+
+// consumeQueue drops the first n lines of a message queue (pending.jsonl, or the
+// quiz's quiz-held.jsonl); the file goes away once it's empty.
+func consumeQueue(path string, n int) error {
+	msgs, err := readPending(path)
 	if err != nil {
 		return err
 	}
 	if n >= len(msgs) {
-		return os.Remove(b.pendingFile())
+		return os.Remove(path)
 	}
 	var sb strings.Builder
 	for _, p := range msgs[n:] {
@@ -162,11 +166,11 @@ func (b *Bot) consumePending(n int) error {
 		sb.Write(raw)
 		sb.WriteByte('\n')
 	}
-	tmp := b.pendingFile() + ".tmp"
+	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(sb.String()), 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, b.pendingFile())
+	return os.Rename(tmp, path)
 }
 
 // heldMsg is what an owner job leaves in the queue. ok=false for machine jobs

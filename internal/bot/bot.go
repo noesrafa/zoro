@@ -55,7 +55,7 @@ Commands:
 /model <opus|sonnet|haiku|fable|claude-…> — switch model (persists)
 /effort <low|medium|high|xhigh|max> — set reasoning effort (persists)
 /idioma <es|en> — force Spanish replies, or back to the soul's English default (persists)
-/gate <on|off> — English gate: a Spanish message gets its English version back instead of an answer (start with ! to skip)
+/gate <on|off> — English gate: a mistake (or Spanish) gets a 3-puzzle quiz link; my next answer waits until you solve it (start with ! to skip; /gate spanish on|off)
 /voice <msg> — reply with a voice note
 /btw <question> — side-question in parallel on Opus (researches freely, won't touch this chat)
 /crons — list scheduled messages (and next run)
@@ -118,11 +118,20 @@ type Bot struct {
 	// agents' dirs. Both are fields only so tests can stand in for them.
 	run  func(ctx context.Context, sessionID string, create bool, prompt string, o claude.RunOpts) (claude.Result, error)
 	sudo func(ctx context.Context, args ...string) ([]byte, error)
-	// coach checks the owner's typed English for the gate (gate.go); a field so tests can stand in.
-	coach func(ctx context.Context, text string) (coachVerdict, error)
-	// gatedAt: when the gate last bounced an owner message (one bounce per request).
-	gateMu  sync.Mutex
-	gatedAt time.Time
+	// makeQuiz judges the owner's typed English and makes the quiz (quiz.go):
+	// ok=false with no error = clean English. A field so tests can stand in.
+	makeQuiz func(ctx context.Context, text string, spanish bool) (q quiz, ok bool, err error)
+	// English gate, quiz mode (quiz.go): the pending quiz (nil = no wall), loaded
+	// from <state>/quiz.json once; whether messages are held; one quiz made at a
+	// time; whether the release turn is queued; quizWG waits for quizzes in flight.
+	quizMu       sync.Mutex
+	quizCur      *quizPending
+	quizLoaded   bool
+	quizHeld     atomic.Bool
+	quizBusy     atomic.Bool
+	quizReleased atomic.Bool
+	quizRetryAt  atomic.Int64 // unix ns: no new release turn before this (a failed one waits)
+	quizWG       sync.WaitGroup
 
 	// Pause (pause.go): last canned ack per chat, and whether the resume turn is queued.
 	ackMu        sync.Mutex
@@ -146,6 +155,8 @@ type job struct {
 	isRollover bool
 	// isPending: the resume turn that bundles the messages saved during a pause.
 	isPending bool
+	// isQuizRelease: the turn that answers the messages held behind a quiz (quiz.go).
+	isQuizRelease bool
 }
 
 // collectWindow is how long the collector waits for more messages before
@@ -183,7 +194,7 @@ func New(cfg config.Config, log *slog.Logger, store *session.Store, set *setting
 		sudo:      defaultSudo,
 	}
 	b.run = b.cd.Run
-	b.coach = b.defaultCoach
+	b.makeQuiz = b.generateQuiz
 	// Coalesce albums and quick bursts into a single turn (see internal/collector).
 	b.collector = collector.New(collectWindow, func(chatID int64, msgs []*tg.Message) {
 		b.enqueue(job{chatID: chatID, msgs: msgs})
@@ -222,6 +233,8 @@ func (b *Bot) Run(ctx context.Context) error {
 	go b.pauseLoop(ctx)
 	// Outbox watcher: delivers what detached jobs drop between turns.
 	go b.outboxLoop(ctx)
+	// English gate, quiz mode: notices a solved quiz and releases the held messages.
+	go b.quizLoop(ctx)
 
 	b.log.Info("zoro online",
 		"owner", b.cfg.OwnerID, "workdir", b.cfg.WorkDir, "model", b.cfg.ClaudeModel,
@@ -439,26 +452,7 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 				b.send(ctx, m.Chat.ID, "⚠️ Usage: /idioma <es|en>")
 			}
 		case "/gate":
-			switch strings.ToLower(firstArg(text, fields[0])) {
-			case "on", "si", "sí", "yes":
-				if err := b.set.SetGate(true); err != nil {
-					b.send(ctx, m.Chat.ID, "⚠️ "+err.Error())
-					return
-				}
-				b.send(ctx, m.Chat.ID, "🇬🇧 English gate ON: if you write in Spanish I'll only send it back in English, so you can say it in English. Start a message with ! to skip it. (/gate off to turn it off)")
-			case "off", "no":
-				if err := b.set.SetGate(false); err != nil {
-					b.send(ctx, m.Chat.ID, "⚠️ "+err.Error())
-					return
-				}
-				b.send(ctx, m.Chat.ID, "✅ English gate OFF")
-			default:
-				state := "off"
-				if b.set.Get().Gate {
-					state = "on"
-				}
-				b.send(ctx, m.Chat.ID, "English gate: "+state+"\nUsage: /gate <on|off>")
-			}
+			b.handleGate(ctx, m.Chat.ID, fields)
 		case "/voice":
 			rest := strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
 			if rest == "" {
@@ -593,6 +587,22 @@ func (b *Bot) process(parent context.Context, j job) {
 		}
 		prompt, pendingN = pendingPrompt(msgs), len(msgs)
 	}
+	heldN := 0     // quiz release turn: how many held messages it carries
+	quizText := "" // what the English quiz judges, in parallel with the answer
+	if j.isQuizRelease {
+		defer b.quizReleased.Store(false)
+		if b.paused() {
+			return // the held messages wait for /start
+		}
+		msgs, _ := readPending(b.quizHeldFile())
+		if len(msgs) == 0 {
+			return
+		}
+		prompt, heldN = quizHeldPrompt(msgs), len(msgs)
+		if b.quizOn() {
+			quizText = heldQuizText(msgs)
+		}
+	}
 	if len(j.msgs) > 0 {
 		var notes []string
 		var err error
@@ -631,13 +641,18 @@ func (b *Bot) process(parent context.Context, j job) {
 		return
 	}
 
-	// English gate (gate.go): a Spanish message from the owner gets its English
-	// version back instead of an answer. Only real owner messages without files;
-	// "!" skips it. Any failure falls through to a normal answer.
-	if isOwner && b.set.Get().Gate && len(j.msgs) > 0 && len(files) == 0 && !gateBypass(texts) {
-		if b.englishGate(ctx, j, texts, transcripts) {
+	// English gate, quiz mode (quiz.go): while a quiz is pending the owner's
+	// message is held for later; otherwise his typed English may get a quiz, made
+	// in parallel — the answer never waits for it. Commands and "!" always pass.
+	if isOwner && len(j.msgs) > 0 && j.msgs[0].From != nil && j.msgs[0].From.ID == b.cfg.OwnerID &&
+		b.quizOn() && !quizPasses(texts) {
+		if b.quizHold(parent, j, prompt, held) {
 			return
 		}
+		quizText = quizCandidate(texts)
+	}
+	if quizText != "" {
+		b.startQuiz(j.chatID, quizText)
 	}
 
 	b.turnMu.Lock()
@@ -783,6 +798,12 @@ func (b *Bot) process(parent context.Context, j job) {
 		if err := b.consumePending(pendingN); err != nil {
 			b.log.Warn("resume: could not clear the saved messages", "err", err)
 		}
+	}
+	if heldN > 0 {
+		if err := consumeQueue(b.quizHeldFile(), heldN); err != nil {
+			b.log.Warn("quiz: could not clear the held messages", "err", err)
+		}
+		b.quizRetryAt.Store(0)
 	}
 
 	stopTyping()
@@ -1240,7 +1261,7 @@ func (b *Bot) registerCommands(ctx context.Context) {
 		{Command: "percance", Description: "🚨 Emergencia vial: seguro, teléfonos, qué hacer"},
 		{Command: "focus", Description: "Fresh session inside a project: /focus <name|off>"},
 		{Command: "idioma", Description: "Switch idioma: /idioma es|en"},
-		{Command: "gate", Description: "🇬🇧 English gate: /gate on|off"},
+		{Command: "gate", Description: "🇬🇧 English quiz gate: /gate on|off"},
 		{Command: "revivir", Description: "🔑 Revivir el login de Claude (zoro/sky/tequila) desde el cel"},
 		{Command: "stop", Description: "⏸️ Pause ALL agents (messages get saved)"},
 		{Command: "start", Description: "▶️ Un-pause all agents, pick up saved messages"},

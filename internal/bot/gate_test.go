@@ -46,11 +46,19 @@ func TestLooksSpanish(t *testing.T) {
 	}
 }
 
-func TestGateBypass(t *testing.T) {
-	if !gateBypass([]string{"! esto es urgente, contéstame en español"}) {
-		t.Error("! prefix must bypass the gate")
+// Commands and "!" always pass the quiz wall; nothing else does.
+func TestQuizPasses(t *testing.T) {
+	for _, s := range []string{"! esto es urgente, contéstame en español", "/gate off", "  /stop"} {
+		if !quizPasses([]string{s}) {
+			t.Errorf("must pass the wall: %q", s)
+		}
 	}
-	if gateBypass([]string{"oye wey cómo va todo"}) {
-		t.Error("no prefix must not bypass")
+	for _, s := range []string{"oye wey cómo va todo", "ok", "what we have in r2?"} {
+		if quizPasses([]string{s}) {
+			t.Errorf("must not pass the wall: %q", s)
+		}
+	}
+	if quizPasses(nil) {
+		t.Error("an empty message must not pass")
 	}
 }

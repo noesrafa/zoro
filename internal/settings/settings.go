@@ -22,6 +22,9 @@ type Settings struct {
 	// Gate turns on the English gate (/gate on): a Spanish message from the owner
 	// gets its English version back instead of an answer. Off by default.
 	Gate bool `json:"gate,omitempty"`
+	// GateSpanishOff: with the gate on, a Spanish message gets no "Say it in
+	// English" quiz (only English with mistakes does). Off = Spanish quizzes ON.
+	GateSpanishOff bool `json:"gate_spanish_off,omitempty"`
 }
 
 // Store guards settings.json.
@@ -85,6 +88,14 @@ func (s *Store) SetGate(on bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.s.Gate = on
+	return s.save()
+}
+
+// SetGateSpanishOff persists the Spanish-quiz switch of the gate.
+func (s *Store) SetGateSpanishOff(off bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.s.GateSpanishOff = off
 	return s.save()
 }
 

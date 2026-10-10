@@ -81,11 +81,11 @@ type Config struct {
 	MiMoModel   string
 	MiMoBaseURL string
 
-	// English gate grammar coach (gate.go): a fast cloud model (Ollama Cloud,
-	// native /api/chat) that checks the owner's typed English when /gate is on.
-	CoachKeyFile string
-	CoachModel   string
-	CoachURL     string
+	// English gate, quiz mode (quiz.go): the static quiz site's folder (q/<id>.json
+	// written here, solved/<id> PUT by the page) and its public URL. Empty QuizDir =
+	// no quiz site: the default everywhere but Zoro.
+	QuizDir string
+	QuizURL string
 }
 
 // Agent is another engine on this VPS: its unix user (== its name) and state dir.
@@ -125,10 +125,14 @@ func Load() (Config, error) {
 		MiMoKeyFile:   getenv("ZORO_MIMO_KEY_FILE", "/home/rafael/.secrets/mimo.key"),
 		MiMoModel:     getenv("ZORO_MIMO_MODEL", "mimo-v2.6-pro"),
 		MiMoBaseURL:   getenv("ZORO_MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/anthropic"),
-		CoachKeyFile:  getenv("ZORO_COACH_KEY_FILE", "/home/rafael/.secrets/ollama-cloud.key"),
-		CoachModel:    getenv("ZORO_COACH_MODEL", "gemma4:31b"),
-		CoachURL:      getenv("ZORO_COACH_URL", "https://ollama.com/api/chat"),
+		QuizURL:       getenv("ZORO_QUIZ_URL", "https://coach.dominioartificial.com"),
 	}
+	// The quiz site is rafiña's: only Zoro writes there unless an agent sets its own.
+	quizDir := ""
+	if c.AgentName == "zoro" {
+		quizDir = "/home/rafael/dominioartificial/coach"
+	}
+	c.QuizDir = getenv("ZORO_QUIZ_DIR", quizDir)
 	c.Agents = parseAgents(getenv("ZORO_AGENTS", ""))
 	if len(c.MirrorChatIDs) > 0 {
 		c.MirrorChatID = c.MirrorChatIDs[0]
