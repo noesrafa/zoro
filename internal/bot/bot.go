@@ -157,6 +157,10 @@ type job struct {
 	isPending bool
 	// isQuizRelease: the turn that answers the messages held behind a quiz (quiz.go).
 	isQuizRelease bool
+	// isSide: a cron that runs in a fresh throwaway session, not the main one
+	// (digest.go); cronID names it in the digest.
+	isSide bool
+	cronID string
 }
 
 // collectWindow is how long the collector waits for more messages before
@@ -658,6 +662,10 @@ func (b *Bot) process(parent context.Context, j job) {
 	b.turnMu.Lock()
 	defer b.turnMu.Unlock()
 	cur := b.set.Get()
+	if j.isSide {
+		b.processSide(ctx, parent, j, prompt, cur, stopTyping)
+		return
+	}
 	// One session per backend (/auth): the session a turn runs on ALWAYS belongs
 	// to the backend it runs on. /auth already swapped it; this catches anything
 	// that moved the backend another way (settings.json edited by hand, a crash
@@ -676,7 +684,14 @@ func (b *Bot) process(parent context.Context, j job) {
 
 	// On a NEW session, prime the conversation once with the heavy context.md
 	// (durable background about rafiña). On resumes it's already in history.
-	tagged := b.otherOwnerTag(j) + prompt
+	// What the side-session crons told the owner since the last main turn rides
+	// on this one (never on a slash command, which must stay first), and is
+	// cleared once the turn went through.
+	digest, digestN := "", 0
+	if !j.isCompact && !strings.HasPrefix(strings.TrimSpace(prompt), "/") {
+		digest, digestN = b.cronDigest()
+	}
+	tagged := digest + b.otherOwnerTag(j) + prompt
 	turnPrompt := tagged
 	if !st.Created {
 		turnPrompt = b.primeWithContext(tagged)
@@ -694,7 +709,7 @@ func (b *Bot) process(parent context.Context, j job) {
 		b.log.Warn("session id already exists on create, resuming instead", "id", st.SessionID)
 		_ = b.store.MarkCreated()
 		st = b.store.Current()
-		res, err = b.run(ctx, st.SessionID, false, prompt, opts)
+		res, err = b.run(ctx, st.SessionID, false, tagged, opts)
 	}
 	// The API itself answered with an error (limit, MiMo quota/auth…): the CLI
 	// had already written the turn into the transcript, so the session is intact.
@@ -739,7 +754,7 @@ func (b *Bot) process(parent context.Context, j job) {
 		// and retry ONCE. Measured 2026-08-20: this fired ~once a day and every single
 		// time the credential was healthy again minutes later.
 		if b.healCredentials(ctx) {
-			retryPrompt := prompt
+			retryPrompt := tagged
 			if wasNew {
 				retryPrompt = turnPrompt // the prime never landed; resend it
 			}
@@ -799,6 +814,12 @@ func (b *Bot) process(parent context.Context, j job) {
 			b.log.Warn("resume: could not clear the saved messages", "err", err)
 		}
 	}
+	if digestN > 0 {
+		if err := b.clearDigest(digestN); err != nil {
+			b.log.Warn("cron digest: could not clear it", "err", err)
+		}
+	}
+	b.log.Info("turn done", "job", j.label, "input_tokens", res.Usage.Input(), "output_tokens", res.Usage.OutputTokens)
 	if heldN > 0 {
 		if err := consumeQueue(b.quizHeldFile(), heldN); err != nil {
 			b.log.Warn("quiz: could not clear the held messages", "err", err)
@@ -1417,7 +1438,9 @@ func (b *Bot) fireCron(j cron.Job) {
 	}
 	prompt := "[⏰ Cron automático \"" + j.ID + "\" — disparado a su hora programada (CDMX). " +
 		"Atiende esto y mándame el resultado de forma breve, como un recordatorio/aviso:]\n\n" + j.Prompt
-	b.enqueue(job{chatID: b.cfg.OwnerID, prompt: prompt, label: "⏰ cron \"" + j.ID + "\""})
+	// Every cron but the rollover and "main": true ones (despertares included)
+	// runs in its own throwaway session (digest.go).
+	b.enqueue(job{chatID: b.cfg.OwnerID, prompt: prompt, label: "⏰ cron \"" + j.ID + "\"", isSide: !j.Main, cronID: j.ID})
 }
 
 // findCron loads crons.json and returns the entry matching ref, which can be a

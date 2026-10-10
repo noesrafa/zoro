@@ -43,6 +43,13 @@ type Job struct {
 	// brief and rotates to a FRESH session, so the next day starts with clean
 	// context instead of an ever-growing transcript.
 	Rollover bool `json:"rollover"`
+
+	// Main runs the job inside the main conversation, as every cron did before.
+	// Default (false): a fresh throwaway session with the same soul and
+	// context.md, so a 9 am reminder doesn't re-read the whole day's transcript;
+	// what it told the owner reaches the main session as a short digest.
+	// The rollover always runs in the main session.
+	Main bool `json:"main,omitempty"`
 }
 
 // File is the on-disk shape of crons.json.
