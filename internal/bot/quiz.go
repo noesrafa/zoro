@@ -21,9 +21,9 @@ package bot
 //     (coach.dominioartificial.com, static nginx) and is added to the hub,
 //     <QuizDir>/hub.json (newest first). The page at / lists the hub; he solves
 //     them whenever he wants and the page PUTs <QuizDir>/solved/<id> (nginx DAV).
-//   - To do = in the hub with no solved/<id>. Only when that goes from 0 to 1 he
-//     gets ONE line ("🧩 New quiz in your hub: <link> — 📌 <rule>"); the others
-//     stack up quietly. /gate shows how many are to do and the link.
+//   - To do = in the hub with no solved/<id>. Every new quiz gets ONE line with its
+//     own link ("🧩 New quiz: <quiz link> — 📌 <rule>"; 10-oct he wanted to see
+//     each one). /gate shows how many are to do and the hub link.
 //   - At start (quizLoop → hubInit): no hub.json yet → it is built from the
 //     q/*.json already there (the practice quiz marked practice); one that
 //     exists gets the q/ quizzes it doesn't list (the old engine published
@@ -93,6 +93,9 @@ func (b *Bot) solvedFile(id string) string { return filepath.Join(b.cfg.QuizDir,
 func (b *Bot) quizOn() bool { return b.cfg.QuizDir != "" && b.set.Get().Gate }
 
 func (b *Bot) hubURL() string { return strings.TrimRight(b.cfg.QuizURL, "/") + "/" }
+
+// quizURL is the link to one quiz page.
+func (b *Bot) quizURL(id string) string { return b.hubURL() + "?q=" + id }
 
 // --- the hub --------------------------------------------------------------
 
@@ -369,7 +372,7 @@ func (b *Bot) startQuiz(chatID int64, text string) *praiseSlot {
 }
 
 // postQuiz publishes a valid quiz and adds it to the hub (unless the gate went
-// off while it was being made). Only the first one to do gets a message.
+// off while it was being made). Each one gets its line with its link.
 func (b *Bot) postQuiz(ctx context.Context, chatID int64, q quiz) {
 	if !b.quizOn() {
 		return
@@ -385,9 +388,9 @@ func (b *Bot) postQuiz(ctx context.Context, chatID int64, q quiz) {
 		return
 	}
 	b.log.Info("quiz: added to the hub", "quiz", q.ID, "kind", q.Kind, "rule", q.Rule.Title, "told", first)
-	if first {
-		b.send(ctx, chatID, "🧩 New quiz in your hub: "+b.hubURL()+" — 📌 "+q.Rule.Title)
-	}
+	_ = first
+	// rafiña 10-oct: "why I don't see the quiz link?" — every quiz gets its line with ITS link.
+	b.send(ctx, chatID, "🧩 New quiz: "+b.quizURL(q.ID)+" — 📌 "+q.Rule.Title)
 }
 
 func writeQuiz(path string, q quiz) error {

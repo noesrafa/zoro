@@ -430,7 +430,7 @@ func (tb *testBot) takeJob(t *testing.T) job {
 	return job{}
 }
 
-const hubNotice = "🧩 New quiz in your hub: https://coach.example/ — 📌 Questions: do/does/did first"
+const hubNotice = "🧩 New quiz: https://coach.example/?q="
 
 // noWallTexts: what the wall used to say. None of it may ever be sent.
 func noWallTexts(t *testing.T, tb *testBot) {
@@ -480,9 +480,8 @@ func TestQuizNeverHolds(t *testing.T) {
 	noWallTexts(t, tb)
 }
 
-// Three quizzes in a row: all published, all in the hub (newest first), and ONE
-// line — the others stack up quietly. Once all are solved the next one is
-// announced again; with one still to do it isn't.
+// Three quizzes in a row: all published, all in the hub (newest first), and each
+// one announced with its own link (10-oct: he wants to see every quiz link).
 func TestQuizHubStacksAndTellsOnce(t *testing.T) {
 	tb, st := quizBot(t)
 	for _, m := range []string{"what we have in r2?", "and what we have in the mac?", "so what we have for today?"} {
@@ -506,30 +505,23 @@ func TestQuizHubStacksAndTellsOnce(t *testing.T) {
 	if q := readQuizFile(t, tb, hub[2].ID); q.Source != "what we have in r2?" {
 		t.Fatalf("oldest last: %+v", hub)
 	}
-	if tb.sentWith("🧩") != 1 || tb.sentWith(hubNotice) != 1 {
-		t.Fatalf("only the first one is announced: %q", tb.sent)
+	if tb.sentWith("🧩") != 3 || tb.sentWith(hubNotice) != 3 {
+		t.Fatalf("each one is announced with its link: %q", tb.sent)
+	}
+	for _, e := range hub {
+		if tb.sentWith("?q="+e.ID) != 1 {
+			t.Fatalf("quiz %s announced with its own link: %q", e.ID, tb.sent)
+		}
 	}
 	if g := tb.gateText(); !strings.Contains(g, "🧩 Quiz hub: 3 to do — https://coach.example/") {
 		t.Fatalf("/gate shows the count and the link: %q", g)
 	}
 
-	// Two solved, one left: a new one stacks quietly.
+	// With some solved and some to do, every new one still gets its line.
 	tb.solve(t, hub[0].ID)
-	tb.solve(t, hub[1].ID)
 	tb.runJob(ownerJob("where we have the keys?"))
-	if tb.sentWith("🧩") != 1 {
-		t.Fatalf("one still to do: no line: %q", tb.sent)
-	}
-	// All solved: the next one is announced.
-	for _, e := range tb.hub(t) {
-		tb.solve(t, e.ID)
-	}
-	if g := tb.gateText(); !strings.Contains(g, "🧩 Quiz hub: 0 to do") {
-		t.Fatalf("/gate after solving: %q", g)
-	}
-	tb.runJob(ownerJob("why we have two backups?"))
-	if tb.sentWith(hubNotice) != 2 || len(tb.hub(t)) != 5 {
-		t.Fatalf("0 → 1 again: one more line: %q", tb.sent)
+	if tb.sentWith(hubNotice) != 4 || len(tb.hub(t)) != 4 {
+		t.Fatalf("a 4th quiz, a 4th line: %q", tb.sent)
 	}
 	noWallTexts(t, tb)
 }
@@ -823,7 +815,7 @@ func TestQuizOneAtATime(t *testing.T) {
 	tb.process(context.Background(), ownerJob("and what we have in the mac?"))
 	close(release)
 	tb.quizWG.Wait()
-	if st.n() != 1 || tb.sentWith("New quiz in your hub") != 1 || tb.nCalls() != 2 || len(tb.hub(t)) != 1 {
+	if st.n() != 1 || tb.sentWith("🧩 New quiz: ") != 1 || tb.nCalls() != 2 || len(tb.hub(t)) != 1 {
 		t.Fatalf("one quiz at a time, both answered: quiz=%d sent=%q calls=%d", st.n(), tb.sent, tb.nCalls())
 	}
 }

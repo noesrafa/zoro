@@ -70,7 +70,7 @@ func TestQuizPraiseCleanThenMistake(t *testing.T) {
 	// A mistake: quiz, no praise, streak 0 (best kept).
 	n := tb.nSent()
 	tb.runJob(ownerJob("what we have in r2?"))
-	if tb.sentWith("New quiz in your hub") != 1 || tb.nSent() != n+2 {
+	if tb.sentWith("🧩 New quiz: ") != 1 || tb.nSent() != n+2 {
 		t.Fatalf("a mistake gets the answer and the quiz only: sent=%q", tb.sent[n:])
 	}
 	for _, s := range tb.sent[n:] {
