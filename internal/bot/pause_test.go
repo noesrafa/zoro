@@ -350,11 +350,12 @@ func TestStopAndStartFlipEveryFlag(t *testing.T) {
 	}
 }
 
-func TestLimitAnywherePausesEveryoneAndTellsRafinaOnce(t *testing.T) {
+// 11-oct-2026: agents run on different accounts now (Sky on the old one), so a
+// sub-agent's limit pauses ONLY that agent; Zoro tells rafiña once and keeps working.
+func TestSubAgentLimitPausesOnlyItAndTellsRafinaOnce(t *testing.T) {
 	tb := newTestBot(t, "zoro")
 	agentDirs(t, tb)
 	sky := tb.cfg.Agents[0]
-	// Sky hit the limit and paused itself.
 	raw := `{"since":"2026-09-26T04:32:00Z","reason":"limit","resets":"11pm (America/Mexico_City)","detail":"` + banner + `","agent":"sky"}`
 	if err := os.WriteFile(filepath.Join(sky.StateDir, "paused"), []byte(raw), 0o644); err != nil {
 		t.Fatal(err)
@@ -362,21 +363,18 @@ func TestLimitAnywherePausesEveryoneAndTellsRafinaOnce(t *testing.T) {
 	tb.watchAgents(context.Background())
 	tb.watchAgents(context.Background())
 
-	if !tb.paused() {
-		t.Fatal("zoro must pause itself")
+	if tb.paused() {
+		t.Fatal("zoro must keep working")
 	}
-	if _, ok := readPause(filepath.Join(tb.cfg.Agents[1].StateDir, "paused")); !ok {
-		t.Fatal("tequila must be paused too")
+	if _, ok := readPause(filepath.Join(tb.cfg.Agents[1].StateDir, "paused")); ok {
+		t.Fatal("tequila must NOT be paused")
 	}
 	if f, _ := readPause(filepath.Join(sky.StateDir, "paused")); f.Agent != "sky" {
 		t.Fatal("sky's own flag must be left as it is")
 	}
-	want := "⏸️ Weekly limit hit (resets 11pm (America/Mexico_City)). Paused zoro, sky and tequila so nobody spams errors."
+	want := "⏸️ sky hit its own usage limit (resets 11pm (America/Mexico_City)) and paused itself. Everyone else keeps working."
 	if tb.sentWith(want) != 1 || len(tb.sent) != 1 {
 		t.Fatalf("want exactly one notice %q, sent %q", want, tb.sent)
-	}
-	if tb.sentWith("/auth mimo and /start") != 1 {
-		t.Fatal("the notice must offer MiMo")
 	}
 }
 
