@@ -138,6 +138,7 @@ type Bot struct {
 	ackMu        sync.Mutex
 	acked        map[int64]time.Time
 	greeted      map[int64]bool // chats already told "I'm back" for the current pause
+	limitSeen    map[string]string // agent → Since of the limit flag already reported (watchAgents tells once, never pauses others)
 	resumeQueued atomic.Bool
 }
 

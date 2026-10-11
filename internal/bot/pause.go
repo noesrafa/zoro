@@ -331,22 +331,36 @@ func (b *Bot) pauseEveryoneForLimit(ctx context.Context, f pauseFlag) {
 }
 
 // watchAgents (Zoro, ~every 60 s): a sub-agent that hits the limit only pauses
-// itself; noticing its flag here is what pauses the rest and tells rafiña.
+// itself — and now stays that way. 11-oct-2026: Sky (old account) hit ITS limit and this
+// paused Zoro, Tequila and Rinzler too, though they run on another account with room
+// left; rafiña: «why you died? I have a lot of usage». Agents no longer share one
+// account, so a sub-agent's limit is reported to him ONCE and nobody else stops.
 func (b *Bot) watchAgents(ctx context.Context) {
 	if b.paused() {
-		return // already paused: the message went out when that happened
+		return
 	}
 	for _, a := range b.cfg.Agents {
 		f, ok := b.agentFlag(ctx, a)
 		if !ok || f.Reason != reasonLimit {
 			continue
 		}
-		b.log.Warn("agent hit the usage limit — pausing everyone", "agent", a.Name)
-		if err := b.writeOwnPause(f); err != nil {
-			b.log.Error("could not write own pause flag", "err", err)
+		b.ackMu.Lock()
+		if b.limitSeen == nil {
+			b.limitSeen = map[string]string{}
 		}
-		b.pauseEveryoneForLimit(ctx, f)
-		return
+		seen := b.limitSeen[a.Name] == f.Since
+		b.limitSeen[a.Name] = f.Since
+		b.ackMu.Unlock()
+		if seen {
+			continue
+		}
+		b.log.Warn("agent hit the usage limit — only it is paused", "agent", a.Name)
+		when := ""
+		if f.Resets != "" {
+			when = " (resets " + f.Resets + ")"
+		}
+		b.send(ctx, b.cfg.OwnerID, "⏸️ "+a.Name+" hit its own usage limit"+when+
+			" and paused itself. Everyone else keeps working. Its messages are saved; /start brings it back.")
 	}
 }
 
