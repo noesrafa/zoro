@@ -105,6 +105,8 @@ func newTestBot(t *testing.T, name string) *testBot {
 		}
 		return exec.CommandContext(ctx, clean[0], clean[1:]...).CombinedOutput()
 	}
+	// Old layout by default: the other agents' dirs belong to their own users.
+	tb.ownDir = func(string) bool { return false }
 	return tb
 }
 
@@ -477,5 +479,29 @@ func TestHumanList(t *testing.T) {
 		if got := humanList(strings.Split(in, ",")); got != want {
 			t.Errorf("humanList(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// One-user layout (11-oct-2026): the agents' state dirs belong to rafael like
+// Zoro's, so /stop and /start write and remove their flags without sudo.
+func TestStopAndStartOneUserNoSudo(t *testing.T) {
+	tb := newTestBot(t, "zoro")
+	agentDirs(t, tb)
+	tb.ownDir = ownedByMe
+	ctx := context.Background()
+	tb.stopAll(ctx, 1)
+	for _, a := range tb.cfg.Agents {
+		if f, ok := readPause(filepath.Join(a.StateDir, "paused")); !ok || f.Reason != reasonStop {
+			t.Fatalf("%s: want a stop flag, got %+v ok=%v", a.Name, f, ok)
+		}
+	}
+	tb.startAll(ctx, 1)
+	for _, a := range tb.cfg.Agents {
+		if _, err := os.Stat(filepath.Join(a.StateDir, "paused")); !os.IsNotExist(err) {
+			t.Fatalf("%s: flag must be gone after /start: %v", a.Name, err)
+		}
+	}
+	if len(tb.sudos) != 0 {
+		t.Fatalf("own dirs need no sudo, calls: %q", tb.sudos)
 	}
 }

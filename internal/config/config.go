@@ -19,6 +19,9 @@ type Config struct {
 
 	ClaudeBin   string
 	ClaudeModel string
+	// ClaudeTokenFile: one long-lived `claude setup-token` token for every agent
+	// (ZORO_CLAUDE_TOKEN_FILE, 11-oct-2026). Unset = the CLI's own login.
+	ClaudeTokenFile string
 	Effort      string
 	WorkDir     string
 	EngineDir   string // where zoro's own Go source lives (for /redeploy build)
@@ -83,6 +86,10 @@ type Config struct {
 	// Agents are the OTHER engines this one pauses/resumes with /stop and /start
 	// (ZORO_AGENTS=sky:/home/sky/engine/state,…). Only Zoro sets it.
 	Agents []Agent
+	// AgentsDir (ZORO_AGENTS_DIR, e.g. /home/rafael/agentes): one folder per agent
+	// with an agente.env, all run by user rafael as zoro@<name>.service. They are
+	// discovered on every call to AllAgents, so a new agent needs no restart of Zoro.
+	AgentsDir string
 
 	// MiMo backend for /auth mimo (Xiaomi Token Plan, Anthropic-compatible).
 	MiMoKeyFile string
@@ -96,10 +103,53 @@ type Config struct {
 	QuizURL string
 }
 
-// Agent is another engine on this VPS: its unix user (== its name) and state dir.
+// Agent is another engine on this VPS: its name and state dir. Unit is its
+// systemd unit: "<name>" for the old one-user-per-agent layout, "zoro@<name>" for
+// the folders in AgentsDir.
 type Agent struct {
 	Name     string
 	StateDir string
+	Unit     string
+}
+
+// AllAgents is ZORO_AGENTS plus every folder in AgentsDir that has an agente.env
+// (a folder wins over a ZORO_AGENTS entry with the same name: after the move to one
+// user, the folder is the live one). This agent itself and symlinks are skipped.
+func (c Config) AllAgents() []Agent {
+	found := discoverAgents(c.AgentsDir, c.AgentName)
+	seen := map[string]bool{}
+	for _, a := range found {
+		seen[a.Name] = true
+	}
+	out := make([]Agent, 0, len(c.Agents)+len(found))
+	for _, a := range c.Agents {
+		if !seen[a.Name] {
+			out = append(out, a)
+		}
+	}
+	return append(out, found...)
+}
+
+func discoverAgents(dir, self string) []Agent {
+	if dir == "" {
+		return nil
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []Agent
+	for _, e := range ents {
+		name := e.Name()
+		if !e.IsDir() || name == self || strings.HasPrefix(name, ".") {
+			continue // symlinks (agentes/zoro → ~/.zoro) aren't dirs here
+		}
+		if _, err := os.Stat(filepath.Join(dir, name, "agente.env")); err != nil {
+			continue
+		}
+		out = append(out, Agent{Name: name, StateDir: filepath.Join(dir, name, "state"), Unit: "zoro@" + name})
+	}
+	return out
 }
 
 // Load reads configuration, applying defaults. Token and OwnerID are required.
@@ -142,6 +192,8 @@ func Load() (Config, error) {
 	}
 	c.QuizDir = getenv("ZORO_QUIZ_DIR", quizDir)
 	c.Agents = parseAgents(getenv("ZORO_AGENTS", ""))
+	c.AgentsDir = getenv("ZORO_AGENTS_DIR", "")
+	c.ClaudeTokenFile = getenv("ZORO_CLAUDE_TOKEN_FILE", "")
 	if len(c.MirrorChatIDs) > 0 {
 		c.MirrorChatID = c.MirrorChatIDs[0]
 	}
@@ -173,6 +225,17 @@ func Load() (Config, error) {
 		}
 	}
 
+	// The bot token can come by reference (TELEGRAM_BOT_TOKEN_FILE, e.g. a systemd
+	// credential of ~/.secrets/bots/<agent>.token) so agente.env holds no secret.
+	if c.Token == "" {
+		if f := getenv("TELEGRAM_BOT_TOKEN_FILE", ""); f != "" {
+			raw, err := os.ReadFile(f)
+			if err != nil {
+				return c, fmt.Errorf("TELEGRAM_BOT_TOKEN_FILE: %w", err)
+			}
+			c.Token = strings.TrimSpace(string(raw))
+		}
+	}
 	if c.Token == "" {
 		return c, errors.New("TELEGRAM_BOT_TOKEN is required")
 	}
@@ -191,7 +254,7 @@ func parseAgents(v string) []Agent {
 		if !ok || name == "" || !filepath.IsAbs(dir) {
 			continue
 		}
-		out = append(out, Agent{Name: name, StateDir: dir})
+		out = append(out, Agent{Name: name, StateDir: dir, Unit: name})
 	}
 	return out
 }

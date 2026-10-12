@@ -5,8 +5,15 @@
 # aunque el muerto sea el propio Zoro.
 #   revivir.sh inicio <agente>          → abre `claude` → /login en tmux; imprime  URL=<link>
 #   revivir.sh codigo <agente> <código> → pega el código; imprime  OK <resumen>  |  ERROR <motivo>
-#   revivir.sh estado                   → días que le quedan al login de cada agente
+#   revivir.sh estado                   → días que le quedan al login de cada agente + el token global
+#   revivir.sh token-inicio             → `claude setup-token` en tmux (como rafael); imprime  URL=<link>
+#   revivir.sh token-codigo <código>    → pega el código, guarda el token de 1 año en ~/.secrets/claude.token
+#                                          (600) SÓLO si una llamada real con él responde; imprime OK|ERROR
+# Desde el 11-oct-2026 (un solo usuario) los sub-agentes en ~/agentes/<n> usan el token global;
+# el login por agente queda para Zoro y para los que todavía no se mudan.
 set -uo pipefail
+
+TOKEN=/home/rafael/.secrets/claude.token
 
 usuario() { case "$1" in zoro) echo rafael;; sky) echo sky;; tequila) echo tequila;; rinzler) echo rinzler;; dominio) echo dominio;; *) return 1;; esac; }
 comoU() { sudo -n -u "$U" -i "$@"; }          # login shell de ese usuario (su PATH trae su claude)
@@ -20,8 +27,20 @@ cola() { pantalla | grep -v '^\s*$' | tail -6 | cut -c1-160; }
 
 estado() {
   sudo -n python3 - <<'PY'
-import json,time,datetime
-for ag,u in [('zoro','rafael'),('sky','sky'),('tequila','tequila'),('rinzler','rinzler')]:
+import json,time,datetime,os
+T='/home/rafael/.secrets/claude.token'
+if os.path.exists(T) and os.path.getsize(T)>0:
+    m=os.path.getmtime(T); d=(m+365*86400-time.time())/86400
+    print(f"🔑 token global: creado {datetime.datetime.fromtimestamp(m).strftime('%d-%b-%Y')} · vence en ~{d:.0f} días")
+else:
+    print("⚪ token global: no existe todavía (/revivir lo crea)")
+for ag in ['zoro','sky','tequila','rinzler']:
+    nuevo=f'/home/rafael/agentes/{ag}'
+    if ag!='zoro' and os.path.exists(nuevo+'/agente.env'):
+        cred=nuevo+'/claude/.credentials.json'
+        print(f"🔑 {ag}: usa el token global"+(" (le queda un login viejo en su claude/)" if os.path.exists(cred) else ""))
+        continue
+    u={'zoro':'rafael'}.get(ag,ag)
     try:
         o=json.load(open(f'/home/{u}/.claude/.credentials.json')).get('claudeAiOauth',{})
         r=o.get('refreshTokenExpiresAt',0)/1000
@@ -30,13 +49,84 @@ for ag,u in [('zoro','rafael'),('sky','sky'),('tequila','tequila'),('rinzler','r
         d=(r-time.time())/86400
         icono='🔴' if d<=0 else ('⚠️' if d<5 else '✅')
         print(f"{icono} {ag}: {d:.0f} días (vence {datetime.datetime.fromtimestamp(r).strftime('%d-%b')})")
+    except FileNotFoundError:
+        if ag!='zoro' and not os.path.isdir(f'/home/{u}'):
+            continue   # usuario ya borrado
+        print(f"❓ {ag}: no pude leer su login (FileNotFoundError)")
     except Exception as e:
         print(f"❓ {ag}: no pude leer su login ({e.__class__.__name__})")
 PY
 }
 
+# --- token global (claude setup-token) — corre como rafael, sin sudo -------------------------------
+TS=revivir-token
+TCFG=/home/rafael/.cache/zoro-setup-token     # config dir aparte: setup-token no toca ~/.claude de Zoro
+TCLAUDE=${TCLAUDE:-/home/rafael/.local/bin/claude}
+tpantalla() { tmux capture-pane -t "$TS" -p -J 2>/dev/null; }
+tesperar() { local fin=$((SECONDS + $2)); while [ $SECONDS -lt $fin ]; do tpantalla | grep -qE "$1" && return 0; sleep 1; done; return 1; }
+tcola() { tpantalla | grep -v '^\s*$' | grep -v 'sk-ant-' | tail -6 | cut -c1-160; }
+token_inicio() {
+  tmux kill-session -t "$TS" 2>/dev/null
+  mkdir -p "$TCFG" && chmod 700 "$TCFG"
+  [ -f "$TCFG/.claude.json" ] || echo '{"hasCompletedOnboarding": true}' > "$TCFG/.claude.json"
+  tmux new-session -d -s "$TS" -x 250 -y 60 \
+    "env -u ANTHROPIC_API_KEY -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=$TCFG $TCLAUDE setup-token" \
+    || { echo "ERROR no pude abrir tmux"; exit 1; }
+  tesperar 'oauth/authorize' 30 || { echo "ERROR no salió el link: $(tcola)"; tmux kill-session -t "$TS"; exit 1; }
+  sleep 1
+  url=$(tpantalla | tr -d '\n' | grep -oE 'https://claude\.com/cai/oauth/authorize[^ ]*state=[A-Za-z0-9_-]+' | head -1)
+  [ -n "$url" ] || { echo "ERROR no pude leer el link"; tmux kill-session -t "$TS"; exit 1; }
+  echo "URL=$url"
+}
+# probar_token <archivo> → 0 si una llamada real con ese token contesta «ok» (config dir vacío: sin login)
+probar_token() {
+  local cfg r
+  cfg=$(mktemp -d /tmp/zoro-tok-XXXX)
+  echo '{"hasCompletedOnboarding": true}' > "$cfg/.claude.json"
+  r=$(cd /tmp && env -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR="$cfg" CLAUDE_CODE_OAUTH_TOKEN="$(cat "$1")" \
+    timeout 90 "$TCLAUDE" -p "Responde exactamente: ok" --strict-mcp-config 2>&1 | tail -1)
+  rm -rf "$cfg"
+  [ "$(echo "$r" | tr -d '[:space:][:punct:]' | tr 'A-Z' 'a-z')" = "ok" ] || { echo "$r" | grep -v 'sk-ant-' | cut -c1-200; return 1; }
+}
+# extraer_token: lee la pantalla por stdin e imprime el token (pegando las líneas que lo continúan si se partió)
+extraer_token() {
+  python3 -c '
+import re,sys
+ls=sys.stdin.read().splitlines()
+for i,l in enumerate(ls):
+    m=re.search(r"sk-ant-oat\d+-[A-Za-z0-9_-]+",l)
+    if not m: continue
+    t=m.group(0); fin=m.end()==len(l.rstrip()); j=i+1
+    while fin and j<len(ls) and re.fullmatch(r"\s*[A-Za-z0-9_-]+\s*",ls[j]):
+        t+=ls[j].strip(); j+=1
+    print(t); break'
+}
+token_codigo() {
+  local code=$1 tok err
+  [[ "$code" =~ ^[A-Za-z0-9_-]+#[A-Za-z0-9_-]+$ ]] || { echo "ERROR eso no parece el código (debe verse como xxxx#yyyy)"; exit 2; }
+  tmux has-session -t "$TS" 2>/dev/null || { echo "ERROR no hay un setup-token esperando; manda /revivir otra vez"; exit 1; }
+  tmux send-keys -t "$TS" -l "$code"; sleep 0.5; tmux send-keys -t "$TS" Enter
+  tesperar 'sk-ant-oat[0-9]+-' 45 || { echo "ERROR no salió el token: $(tcola)"; tmux kill-session -t "$TS"; exit 1; }
+  sleep 1
+  tok=$(tpantalla | extraer_token)
+  tmux kill-session -t "$TS" 2>/dev/null     # se va el scrollback con el token
+  [ ${#tok} -ge 80 ] || { echo "ERROR no pude leer el token de la pantalla"; exit 1; }
+  mkdir -p "$(dirname "$TOKEN")" && chmod 700 "$(dirname "$TOKEN")"
+  ( umask 077; printf '%s\n' "$tok" > "$TOKEN.new" )
+  tok=""
+  if ! err=$(probar_token "$TOKEN.new"); then
+    echo "ERROR el token se creó pero la prueba falló (no reemplacé el anterior; quedó en claude.token.new): $err"; exit 1
+  fi
+  [ -s "$TOKEN" ] && cp -p "$TOKEN" "$TOKEN.bak-$(date +%Y%m%d-%H%M%S)"
+  mv -f "$TOKEN.new" "$TOKEN" && chmod 600 "$TOKEN"
+  echo "OK guardado en ~/.secrets/claude.token (…$(tail -c 5 "$TOKEN" | tr -d '\n')) · prueba: respondió «ok» · lo toman todos en su siguiente turno"
+}
+
 accion=${1:-estado}
 [ "$accion" = "estado" ] && { estado; exit 0; }
+[ "$accion" = "token-inicio" ] && { token_inicio; exit 0; }
+[ "$accion" = "token-codigo" ] && { token_codigo "${2:-}"; exit 0; }
+[ "$accion" = "token-cancelar" ] && { tmux kill-session -t "$TS" 2>/dev/null; echo "OK cancelado"; exit 0; }
 AG=${2:-}
 U=$(usuario "$AG") || { echo "ERROR agente desconocido: '$AG' (usa zoro, sky, tequila o rinzler)"; exit 2; }
 S="revivir-$AG"

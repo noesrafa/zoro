@@ -1,6 +1,8 @@
 package bot
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +18,8 @@ func TestEsComandoRevivir(t *testing.T) {
 		{"/revivir_sky", "sky", true},
 		{"/revivir_Zoro", "zoro", true},
 		{"/revivir@zorobot dominio", "dominio", true},
+		{"/revivir estado", "estado", true},
+		{"/revivir token", "token", true},
 		{"/revive", "", false},
 		{"/redeploy", "", false},
 	}
@@ -60,5 +64,29 @@ func TestEsperaLogin(t *testing.T) {
 	e.poner("zoro", -time.Second)
 	if _, ok := e.tomar(); ok {
 		t.Fatal("vencido no debe servir")
+	}
+}
+
+func TestUsaTokenGlobal(t *testing.T) {
+	dir := t.TempDir()
+	b := &Bot{}
+	if b.usaTokenGlobal("sky") {
+		t.Fatal("sin ZORO_AGENTS_DIR nadie usa el token global (compatibilidad)")
+	}
+	b.cfg.AgentsDir = dir
+	if b.usaTokenGlobal("sky") {
+		t.Fatal("sky todavía no se mudó: su login viejo")
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "sky"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sky", "agente.env"), []byte("ZORO_AGENT_NAME=sky\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !b.usaTokenGlobal("sky") {
+		t.Fatal("sky ya vive en ~/agentes: token global")
+	}
+	if b.usaTokenGlobal("zoro") {
+		t.Fatal("zoro conserva su propio login")
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -147,4 +148,45 @@ func indexOf(a []string, s string) int {
 		}
 	}
 	return -1
+}
+
+// One shared setup-token for every agent (11-oct-2026): read fresh each turn,
+// replaces any inherited token, never leaks into MiMo mode, and a missing file
+// falls back to the CLI's own login.
+func TestBuildEnvTokenFile(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "claude.token")
+	if err := os.WriteFile(f, []byte("sk-ant-oat01-nuevo\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	parent := []string{"PATH=/bin", "CLAUDE_CODE_OAUTH_TOKEN=viejo"}
+	env, err := buildEnv(parent, "", MiMo{}, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var toks []string
+	for _, e := range env {
+		if strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN=") {
+			toks = append(toks, e)
+		}
+	}
+	if len(toks) != 1 || toks[0] != "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-nuevo" {
+		t.Fatalf("want exactly the file's token, got %q", toks)
+	}
+	env, _ = buildEnv([]string{"PATH=/bin"}, "", MiMo{}, filepath.Join(t.TempDir(), "no-existe"))
+	for _, e := range env {
+		if strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN=") {
+			t.Fatalf("missing file must not set a token: %q", e)
+		}
+	}
+	k := filepath.Join(t.TempDir(), "mimo.key")
+	_ = os.WriteFile(k, []byte("mk"), 0o600)
+	env, err = buildEnv(parent, AuthMiMo, MiMo{KeyFile: k, Model: "m", BaseURL: "u"}, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range env {
+		if strings.HasPrefix(e, "CLAUDE_CODE_OAUTH_TOKEN=") {
+			t.Fatalf("MiMo mode must not carry the Claude token: %q", e)
+		}
+	}
 }

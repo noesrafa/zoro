@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"zoro/internal/claude"
@@ -339,7 +340,7 @@ func (b *Bot) watchAgents(ctx context.Context) {
 	if b.paused() {
 		return
 	}
-	for _, a := range b.cfg.Agents {
+	for _, a := range b.cfg.AllAgents() {
 		f, ok := b.agentFlag(ctx, a)
 		if !ok || f.Reason != reasonLimit {
 			continue
@@ -456,7 +457,13 @@ func (b *Bot) writeAgentFlag(ctx context.Context, a config.Agent, f pauseFlag) e
 		return err
 	}
 	tmp.Close()
-	out, err := b.sudo(ctx, "install", "-o", a.Name, "-g", a.Name, "-m", "644", tmp.Name(), filepath.Join(a.StateDir, pauseFileName))
+	dst := filepath.Join(a.StateDir, pauseFileName)
+	// One-user layout (~/agentes/<name>/state belongs to us): no sudo needed.
+	if b.ownDir != nil && b.ownDir(a.StateDir) {
+		return writeFileAtomic(dst, raw)
+	}
+	owner := a.Name // old layout: unix user == agent name
+	out, err := b.sudo(ctx, "install", "-o", owner, "-g", owner, "-m", "644", tmp.Name(), dst)
 	if err != nil {
 		return fmt.Errorf("%v %s", err, strings.TrimSpace(string(out)))
 	}
@@ -480,7 +487,7 @@ func (b *Bot) agentPending(ctx context.Context, a config.Agent) int {
 // pauseAgents writes f into every agent that isn't paused yet (an existing flag —
 // e.g. the agent's own limit flag — is left as it is).
 func (b *Bot) pauseAgents(ctx context.Context, f pauseFlag) (ok, fails []string) {
-	for _, a := range b.cfg.Agents {
+	for _, a := range b.cfg.AllAgents() {
 		if _, already := b.agentFlag(ctx, a); already {
 			ok = append(ok, a.Name)
 			continue
@@ -530,9 +537,17 @@ func (b *Bot) startAll(ctx context.Context, chatID int64) {
 	if msgs, _ := readPending(b.pendingFile()); len(msgs) > 0 {
 		pending += len(msgs)
 	}
-	for _, a := range b.cfg.Agents {
+	for _, a := range b.cfg.AllAgents() {
 		pending += b.agentPending(ctx, a)
 		if _, ok := b.agentFlag(ctx, a); !ok {
+			continue
+		}
+		if b.ownDir != nil && b.ownDir(a.StateDir) {
+			if err := os.Remove(filepath.Join(a.StateDir, pauseFileName)); err != nil && !os.IsNotExist(err) {
+				fails = append(fails, a.Name+": "+truncate(err.Error(), 120))
+				continue
+			}
+			back = append(back, a.Name)
 			continue
 		}
 		if out, err := b.sudo(ctx, "rm", "-f", filepath.Join(a.StateDir, pauseFileName)); err != nil {
@@ -613,4 +628,27 @@ func joinAnd(xs []string) string {
 		return strings.Join(xs, "")
 	}
 	return strings.Join(xs[:len(xs)-1], ", ") + " and " + xs[len(xs)-1]
+}
+
+// ownedByMe: the dir exists and belongs to this process's uid.
+func ownedByMe(dir string) bool {
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && int(st.Uid) == os.Getuid()
+}
+
+// writeFileAtomic writes beside dst and renames, so a reader never sees half a flag.
+func writeFileAtomic(dst string, raw []byte) error {
+	tmp := dst + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }

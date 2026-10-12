@@ -86,6 +86,7 @@ func cronFire(cfg config.Config, id string) error {
 
 	cd := claude.New(claude.Config{
 		Bin: cfg.ClaudeBin, Model: cfg.ClaudeModel, WorkDir: cfg.WorkDir, DangerSkip: cfg.DangerSkip,
+		TokenFile: cfg.ClaudeTokenFile,
 	})
 	soul, _ := os.ReadFile(cfg.SoulFile)
 	prompt := "[⏰ Cron \"" + job.ID + "\" — disparo manual de prueba. Atiende esto y responde breve, como aviso/recordatorio:]\n\n" + job.Prompt

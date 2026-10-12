@@ -72,7 +72,8 @@ Commands:
 /ls [path] — list VM files
 /stats — VM + git repo status
 /cancel — stop the current task
-/revivir — Claude login days left per agent; /revivir_zoro · /revivir_sky · /revivir_tequila · /revivir_rinzler re-login from the phone (send the link, paste the code)
+/agentes — every sub-agent: up/down, model, pause, saved messages, last turn
+/revivir — new shared Claude token for every agent (claude setup-token: I send the link, you paste the code); /revivir estado — logins and token; /revivir_zoro re-logs Zoro
 /redeploy — rebuild my code + restart (apply changes)
 /update — pull latest code from GitHub + rebuild + restart
 /restart — restart me
@@ -119,6 +120,9 @@ type Bot struct {
 	// agents' dirs. Both are fields only so tests can stand in for them.
 	run  func(ctx context.Context, sessionID string, create bool, prompt string, o claude.RunOpts) (claude.Result, error)
 	sudo func(ctx context.Context, args ...string) ([]byte, error)
+	// ownDir says whether a dir belongs to this process's user (one-user layout:
+	// ~/agentes/<name>/state) — then another agent's flag is written without sudo.
+	ownDir func(dir string) bool
 	// makeQuiz judges the owner's typed English and makes the quiz (quiz.go):
 	// ok=false with no error = clean English, praise its line (quizpraise.go).
 	// A field so tests can stand in.
@@ -184,6 +188,7 @@ func New(cfg config.Config, log *slog.Logger, store *session.Store, set *setting
 			WorkDir:    cfg.WorkDir,
 			DangerSkip: cfg.DangerSkip,
 			MiMo:       claude.MiMo{KeyFile: cfg.MiMoKeyFile, Model: cfg.MiMoModel, BaseURL: cfg.MiMoBaseURL},
+			TokenFile:  cfg.ClaudeTokenFile,
 		}),
 		tts: tts.Config{PiperBin: cfg.PiperBin, PiperVoice: cfg.PiperVoice, FFmpegBin: cfg.FFmpegBin},
 		mediaC: media.Config{
@@ -198,6 +203,7 @@ func New(cfg config.Config, log *slog.Logger, store *session.Store, set *setting
 		jobs:      make(chan job, 16),
 		quit:      make(chan struct{}),
 		sudo:      defaultSudo,
+		ownDir:    ownedByMe,
 	}
 	b.run = b.cd.Run
 	b.makeQuiz = b.generateQuiz
@@ -347,6 +353,9 @@ func (b *Bot) dispatch(ctx context.Context, u tg.Update) {
 				return
 			case "/auth":
 				b.handleAuth(ctx, m.Chat.ID, strings.ToLower(firstArg(text, fields[0])))
+				return
+			case "/agentes", "/agents":
+				go b.send(context.Background(), m.Chat.ID, b.agentesText(context.Background()))
 				return
 			}
 		}
@@ -1305,7 +1314,8 @@ func (b *Bot) registerCommands(ctx context.Context) {
 		{Command: "focus", Description: "Fresh session inside a project: /focus <name|off>"},
 		{Command: "idioma", Description: "Switch idioma: /idioma es|en"},
 		{Command: "gate", Description: "🇬🇧 English quiz gate: /gate on|off"},
-		{Command: "revivir", Description: "🔑 Revivir el login de Claude (zoro/sky/tequila) desde el cel"},
+		{Command: "revivir", Description: "🔑 Token de Claude para todos (o /revivir estado)"},
+		{Command: "agentes", Description: "🤖 Estado de todos los agentes"},
 		{Command: "stop", Description: "⏸️ Pause ALL agents (messages get saved)"},
 		{Command: "start", Description: "▶️ Un-pause all agents, pick up saved messages"},
 		{Command: "auth", Description: "Backend: /auth sub | /auth mimo"},

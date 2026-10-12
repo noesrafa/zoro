@@ -21,6 +21,10 @@ type Config struct {
 	WorkDir    string // cmd.Dir — MUST be constant across calls or --resume forks a new session
 	DangerSkip bool
 	MiMo       MiMo // the alternate backend behind /auth mimo
+	// TokenFile holds a long-lived `claude setup-token` token (one for every agent,
+	// 11-oct-2026). Read fresh on every turn, so /revivir can rotate it without a
+	// restart; empty path or empty file = the CLI's own login, as before.
+	TokenFile string
 }
 
 // AuthMiMo is the RunOpts.Auth value that routes a turn to Xiaomi's MiMo Token
@@ -256,7 +260,7 @@ type event struct {
 
 // Run executes one turn and returns the assistant's final text.
 func (d *Driver) Run(ctx context.Context, sessionID string, create bool, prompt string, o RunOpts) (Result, error) {
-	env, err := buildEnv(os.Environ(), o.Auth, d.cfg.MiMo)
+	env, err := buildEnv(os.Environ(), o.Auth, d.cfg.MiMo, d.cfg.TokenFile)
 	if err != nil {
 		return Result{SessionID: sessionID}, err
 	}
@@ -395,12 +399,17 @@ next:
 }
 
 // buildEnv is the environment of one turn. MiMo mode reads the key file fresh;
-// errors name the file but never contain the key.
-func buildEnv(parent []string, auth string, m MiMo) ([]string, error) {
+// errors name the file but never contain the key. In subscription mode a token
+// file (if any) becomes CLAUDE_CODE_OAUTH_TOKEN; MiMo mode never carries it.
+func buildEnv(parent []string, auth string, m MiMo, tokenFile string) ([]string, error) {
 	env := scrubEnv(parent)
 	if auth != AuthMiMo {
+		if tok := readToken(tokenFile); tok != "" {
+			env = append(dropVar(env, oauthTokenVar), oauthTokenVar+"="+tok)
+		}
 		return env, nil
 	}
+	env = dropVar(env, oauthTokenVar)
 	raw, err := os.ReadFile(m.KeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("mimo key file %s not readable (/auth sub to go back): %w", m.KeyFile, errors.Unwrap(err))
@@ -418,4 +427,29 @@ func buildEnv(parent []string, auth string, m MiMo) ([]string, error) {
 		"ANTHROPIC_DEFAULT_HAIKU_MODEL="+m.Model,
 		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
 	), nil
+}
+
+const oauthTokenVar = "CLAUDE_CODE_OAUTH_TOKEN"
+
+// readToken returns the trimmed token in path ("" if unset, unreadable or empty:
+// the CLI then falls back to its own login, so a missing file never kills a turn).
+func readToken(path string) string {
+	if path == "" {
+		return ""
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+func dropVar(env []string, k string) []string {
+	out := env[:0:0]
+	for _, e := range env {
+		if !strings.HasPrefix(e, k+"=") {
+			out = append(out, e)
+		}
+	}
+	return out
 }
