@@ -108,6 +108,8 @@ def revisar_ruta(p, cwd, escribe=False, origen="esa ruta"):
             bloquear(origen + " (" + q + ") es de otro proceso")
         if any(dentro(q, x) for x in PROHIBIDO_FUERA):
             bloquear(origen + " (" + q + ") es del sistema / de rafiña")
+        if TOKEN_RE.search(q):
+            bloquear("los tokens (Claude / bot) son del engine: no se leen")
         if q.endswith("/.credentials.json"):
             bloquear("los logins de Claude no se leen ni se tocan")
         if dentro(q, MIO):
@@ -126,7 +128,13 @@ def revisar_ruta(p, cwd, escribe=False, origen="esa ruta"):
             bloquear(origen + " (" + q + ") está fuera de tu carpeta")
 
 
+# El token de Claude (de todos) y el del bot: el engine los usa, el agente no los lee ni los imprime.
+TOKEN_RE = re.compile(r"CLAUDE_CODE_OAUTH_TOKEN|TELEGRAM_BOT_TOKEN|zoro-claude\.token|/run/credentials|claude\.token|/environ\b")
+
+
 def revisar_texto_peligroso(texto):
+    if TOKEN_RE.search(texto):
+        bloquear("los tokens (Claude / bot) son del engine: no se leen ni se imprimen")
     if "disableAllHooks" in texto or "allowManagedHooksOnly" in texto:
         bloquear("no se apagan los hooks")
     if re.search(r"(^|[\s'\"=:])ZORO_AGENT_NAME=|(^|[\s'\"])CLAUDE_CONFIG_DIR=|GUARDIA_CONFIG=", texto):
@@ -197,6 +205,8 @@ def revisar_bash(cmd, cwd, permitidos):
         if prog == "sudo":
             revisar_sudo(" ".join(palabras), permitidos)
             continue
+        if prog in ("printenv", "export", "declare", "set", "compgen") or (prog == "env" and len(palabras) == 1):
+            bloquear("«" + prog + "» imprime el entorno (trae el token de Claude)")
         if prog in ESCAPES:
             bloquear("«" + prog + "» corre fuera de tu espacio aislado")
         if prog == "systemctl":

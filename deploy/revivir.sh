@@ -118,7 +118,8 @@ token_codigo() {
     echo "ERROR el token se creó pero la prueba falló (no reemplacé el anterior; quedó en claude.token.new): $err"; exit 1
   fi
   [ -s "$TOKEN" ] && cp -p "$TOKEN" "$TOKEN.bak-$(date +%Y%m%d-%H%M%S)"
-  mv -f "$TOKEN.new" "$TOKEN" && chmod 600 "$TOKEN"
+  # en el MISMO inodo (nada de mv): las unidades zoro@ lo ven por un bind de sólo lectura y un archivo nuevo no les llegaría
+  ( umask 077; cat "$TOKEN.new" > "$TOKEN" ) && chmod 600 "$TOKEN" && rm -f "$TOKEN.new"
   echo "OK guardado en ~/.secrets/claude.token (…$(tail -c 5 "$TOKEN" | tr -d '\n')) · prueba: respondió «ok» · lo toman todos en su siguiente turno"
 }
 

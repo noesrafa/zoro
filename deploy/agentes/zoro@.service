@@ -18,11 +18,14 @@ EnvironmentFile=/home/rafael/agentes/%i/agente.env
 Environment=HOME=/home/rafael/agentes/%i
 Environment=CLAUDE_CONFIG_DIR=/home/rafael/agentes/%i/.claude
 Environment=PATH=/home/rafael/agentes/%i/.local/bin:/home/rafael/agentes/%i/bin:/home/rafael/agentes/%i/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-# Secretos por referencia: systemd los lee como root y se los da al proceso aunque ~/.secrets esté escondido.
+# Secretos por referencia (~/.secrets está escondido abajo):
+#  - token del bot: credencial de systemd (copia al arrancar).
+#  - token de Claude (UNO para todos): bind de sólo lectura del archivo, así un /revivir (que lo reescribe en el
+#    MISMO inodo) llega a todos en su siguiente turno sin reiniciar. Si falta, el agente usa su login (si tiene).
 LoadCredential=bot:/home/rafael/.secrets/bots/%i.token
-LoadCredential=claude:/home/rafael/.secrets/claude.token
 Environment=TELEGRAM_BOT_TOKEN_FILE=%d/bot
-Environment=ZORO_CLAUDE_TOKEN_FILE=%d/claude
+BindReadOnlyPaths=-/home/rafael/.secrets/claude.token:/run/zoro-claude.token
+Environment=ZORO_CLAUDE_TOKEN_FILE=/run/zoro-claude.token
 ExecStart=/home/rafael/agentes/%i/engine/zoro
 Restart=always
 RestartSec=5
