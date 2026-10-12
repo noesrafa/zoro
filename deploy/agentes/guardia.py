@@ -92,10 +92,18 @@ def protegido_escritura(p):
             or p == MIO + "/agente.env")
 
 
+def alias_mio(q):
+    # /home/<agente> queda como symlink a su carpeta tras la mudanza (rutas viejas en sus scripts)
+    viejo = "/home/" + AGENTE
+    return MIO + q[len(viejo):] if dentro(q, viejo) else q
+
+
 def revisar_ruta(p, cwd, escribe=False, origen="esa ruta"):
     if not p:
         return
-    for q in normal(p, cwd):
+    if p == "~" + AGENTE or p.startswith("~" + AGENTE + "/"):
+        p = MIO + p[len(AGENTE) + 1:]
+    for q in map(alias_mio, normal(p, cwd)):
         if PROC_RE.search(q + "/"):
             bloquear(origen + " (" + q + ") es de otro proceso")
         if any(dentro(q, x) for x in PROHIBIDO_FUERA):
@@ -144,8 +152,10 @@ def revisar_bash(cmd, cwd, permitidos):
     # rutas escritas en el comando
     for m in RUTA_HOME.finditer(cmd):
         tok = m.group(1)
-        if tok.startswith("~"):
+        if tok.startswith("~") and tok != "~" + AGENTE:
             bloquear("«" + tok + "» es la carpeta de otro usuario")
+        if tok.startswith("~"):
+            continue
         if tok.startswith("home/"):
             tok = "/" + tok
         revisar_ruta(tok, cwd, escribe=False, origen="el comando")
@@ -158,7 +168,7 @@ def revisar_bash(cmd, cwd, permitidos):
             toks = trozo.split()
         if toks and toks[0] in ("cd", "pushd"):
             destino = next((t for t in toks[1:] if not t.startswith("-")), "~")
-            nuevo = normal(destino, vcwd)[1]
+            nuevo = alias_mio(normal(destino, vcwd)[1])
             if dentro(nuevo, "/home") and not dentro(nuevo, MIO):
                 bloquear("cd a " + nuevo + " te saca de tu carpeta")
             vcwd = nuevo
