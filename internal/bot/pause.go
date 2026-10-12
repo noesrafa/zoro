@@ -17,7 +17,8 @@ package bot
 //     with ONE message to rafiña.
 //
 // The flag is a plain file, so it survives restarts (the nightly update restarts
-// every agent) — nothing but /start ever removes it.
+// every agent). /start removes it; since 11-oct-2026 a LIMIT flag also lifts itself at
+// the announced reset (autoresume.go) — only a /stop pause waits for /start.
 
 import (
 	"context"
@@ -323,10 +324,14 @@ func (b *Bot) pauseEveryoneForLimit(ctx context.Context, f pauseFlag) {
 		when = " (resets " + f.Resets + ")"
 	}
 	msg := "⏸️ " + kind + " hit" + when + ". Paused " + joinAnd(names) +
-		" so nobody spams errors. Messages are being saved. Send /start when you want us back" +
-		" — or /auth mimo and /start to keep going on MiMo."
+		" so nobody spams errors. Messages are being saved, and we pick up ON OUR OWN right after the reset" +
+		" (no /start needed). /auth mimo and /start to keep going on MiMo meanwhile."
 	if len(fails) > 0 {
 		msg += "\n⚠️ Couldn't pause: " + strings.Join(fails, "; ")
+	}
+	if !b.limitNoticeDue() {
+		b.log.Info("limit hit again after an auto-retry — paused quietly")
+		return
 	}
 	b.send(ctx, b.cfg.OwnerID, msg)
 }
@@ -361,7 +366,7 @@ func (b *Bot) watchAgents(ctx context.Context) {
 			when = " (resets " + f.Resets + ")"
 		}
 		b.send(ctx, b.cfg.OwnerID, "⏸️ "+a.Name+" hit its own usage limit"+when+
-			" and paused itself. Everyone else keeps working. Its messages are saved; /start brings it back.")
+			" and paused itself. Everyone else keeps working. Its messages are saved and it picks up on its own after the reset.")
 	}
 }
 
@@ -375,6 +380,7 @@ func (b *Bot) pauseLoop(ctx context.Context) {
 			return
 		case <-t.C:
 		}
+		b.maybeAutoUnpause(ctx)
 		b.maybeResume()
 		if b.isZoro() && n%watchEvery == 0 {
 			b.watchAgents(ctx)

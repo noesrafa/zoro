@@ -144,6 +144,7 @@ type Bot struct {
 	greeted      map[int64]bool // chats already told "I'm back" for the current pause
 	limitSeen    map[string]string // agent → Since of the limit flag already reported (watchAgents tells once, never pauses others)
 	resumeQueued atomic.Bool
+	lastLimitNotice time.Time // last limit message to rafiña (autoresume.go: once per 12 h)
 }
 
 type job struct {
