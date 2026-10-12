@@ -1,0 +1,49 @@
+# zoro@<agente>.service — un sub-agente de Zoro (un solo usuario Linux, 11-oct-2026).
+# Todo lo del agente vive en /home/rafael/agentes/<agente>/ (que es su HOME); su config en agente.env.
+# Instalar: /etc/systemd/system/zoro@.service · por instancia: zoro@<n>.service.d/aislamiento.conf
+# (los otros agentes, InaccessiblePaths) y limites.conf (memoria, NoNewPrivileges) — los escribe `zoro-agente`.
+[Unit]
+Description=Zoro sub-agente %i (Telegram + Claude Code)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+ConditionPathExists=/home/rafael/agentes/%i/agente.env
+
+[Service]
+Type=simple
+User=rafael
+Group=rafael
+WorkingDirectory=/home/rafael/agentes/%i
+EnvironmentFile=/home/rafael/agentes/%i/agente.env
+Environment=HOME=/home/rafael/agentes/%i
+Environment=CLAUDE_CONFIG_DIR=/home/rafael/agentes/%i/.claude
+Environment=PATH=/home/rafael/agentes/%i/.local/bin:/home/rafael/agentes/%i/bin:/home/rafael/agentes/%i/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Secretos por referencia: systemd los lee como root y se los da al proceso aunque ~/.secrets esté escondido.
+LoadCredential=bot:/home/rafael/.secrets/bots/%i.token
+LoadCredential=claude:/home/rafael/.secrets/claude.token
+Environment=TELEGRAM_BOT_TOKEN_FILE=%d/bot
+Environment=ZORO_CLAUDE_TOKEN_FILE=%d/claude
+ExecStart=/home/rafael/agentes/%i/engine/zoro
+Restart=always
+RestartSec=5
+TimeoutStopSec=120
+OOMPolicy=continue
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zoro-%i
+# Aislamiento (capa 3; la 1 es el hook guardia.py): lo de rafiña y de Zoro no existe para el agente.
+ProtectHome=false
+InaccessiblePaths=-/home/rafael/.secrets -/home/rafael/.zoro -/home/rafael/.claude -/home/rafael/.claude.json -/home/rafael/.claude-jobs
+InaccessiblePaths=-/home/rafael/trabajos -/home/rafael/heru -/home/rafael/respaldos -/home/rafael/.ssh -/home/rafael/.config/gh -/home/rafael/.git-credentials -/home/rafael/.cache/zoro-setup-token
+ReadOnlyPaths=-/home/rafael/zoro -/home/rafael/agentes/bin -/home/rafael/agentes/plantillas
+ReadOnlyPaths=-/home/rafael/agentes/%i/.claude/settings.json -/home/rafael/agentes/%i/agente.env
+# sudo (grug-publish / woods) sólo para quien lo necesita: limites.conf pone NoNewPrivileges=yes a los demás.
+NoNewPrivileges=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+LockPersonality=true
+MemoryHigh=1G
+MemoryMax=1500M
+
+[Install]
+WantedBy=multi-user.target

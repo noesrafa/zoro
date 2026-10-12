@@ -1,0 +1,602 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2015,SC2016
+# zoro-agente — alta, baja y control de los sub-agentes de Zoro (un solo usuario Linux, 11-oct-2026).
+#
+# Cada agente es una carpeta ~/agentes/<n>/ (que ES su HOME) y corre como rafael en la unidad
+# plantilla zoro@<n>.service (deploy/agentes/zoro@.service). Este script crea esa carpeta con todo
+# lo que el engine necesita, guarda el token del bot fuera de ella (~/.secrets/bots/<n>.token, se lo
+# pasa systemd con LoadCredential), escribe los drop-ins de la instancia (límites y aislamiento) y
+# la arranca. Zoro (zoro.service, ~/.zoro) NO se administra aquí: sólo aparece en listar/estado.
+#
+#   zoro-agente [--dry-run] nuevo <n> --dueño <id>[,id2] --bot <token> --plantilla familia|dev
+#               [--modelo claude-sonnet-5-5] [--esfuerzo medium] [--nombre-dueño "Nombre"]
+#               [--espejo <chat_id>[,id2]] [--memoria 1500M] [--sudo]
+#   zoro-agente listar
+#   zoro-agente estado [n] [--du]
+#   zoro-agente pausar <n>      · zoro-agente reanudar <n>
+#   zoro-agente borrar <n> [--si]
+#   zoro-agente aislar
+#   zoro-agente ayuda
+#
+# --dry-run (en cualquier posición): imprime cada acción que haría y no toca nada.
+# Para probar en /tmp: AGENTES_DIR, SYSTEMD_DIR, SECRETS_DIR, RESPALDOS_DIR y NO_SYSTEMCTL=1
+# (salta daemon-reload/enable/disable/stop; is-active y journalctl sí se consultan, son de lectura).
+set -uo pipefail
+
+# --- Configuración (todo se puede sobreescribir con variables de entorno) ----------------------
+AGENTES_DIR=${AGENTES_DIR:-/home/rafael/agentes}
+SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
+SECRETS_DIR=${SECRETS_DIR:-/home/rafael/.secrets}
+RESPALDOS_DIR=${RESPALDOS_DIR:-/home/rafael/respaldos/agentes}
+ZORO_BIN=${ZORO_BIN:-/home/rafael/zoro/bin/zoro}
+ZORO_STATE=${ZORO_STATE:-/home/rafael/zoro/state}      # state de Zoro (sólo para listar/estado/pausar)
+CLAUDE_LINK=${CLAUDE_LINK:-/home/rafael/.local/bin/claude}
+CLAUDE_VERSIONS=${CLAUDE_VERSIONS:-/home/rafael/.local/share/claude/versions}
+WHISPER_BIN=${WHISPER_BIN:-/home/rafael/.local/share/whisper.cpp/build/bin/whisper-cli}
+WHISPER_MODEL=${WHISPER_MODEL:-/home/rafael/.local/share/whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin}
+AGENTE_USER=${AGENTE_USER:-rafael}                     # dueño de los archivos si se corre como root
+NO_SYSTEMCTL=${NO_SYSTEMCTL:-0}
+
+AQUI=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+PLANTILLAS_DIR=${PLANTILLAS_DIR:-$AQUI/plantillas}
+[ -d "$PLANTILLAS_DIR" ] || PLANTILLAS_DIR=$AGENTES_DIR/plantillas
+SETTINGS_AGENTE=${SETTINGS_AGENTE:-$AQUI/settings.agente.json}
+
+RESERVADOS="zoro bin plantillas"
+NOMBRE_RE='^[a-z][a-z0-9-]{1,20}$'
+
+# --dry-run es global: se saca de los argumentos esté donde esté.
+DRY=0
+ARGS=()
+for a in "$@"; do
+  if [ "$a" = "--dry-run" ]; then DRY=1; else ARGS+=("$a"); fi
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+ES_ROOT=0
+[ "$(id -u)" = 0 ] && ES_ROOT=1
+
+# --- Utilidades --------------------------------------------------------------------------------
+muere() { echo "✗ $*" >&2; exit 1; }
+aviso() { echo "⚠️  $*" >&2; }
+paso()  { echo "→ $*"; }
+
+hacer() {  # ejecuta, o en dry-run sólo lo describe
+  if [ $DRY = 1 ]; then echo "  [dry-run] $*"; return 0; fi
+  "$@"
+}
+
+# sudo -n sólo si no somos root y la ruta (o su primer padre existente) no es escribible.
+necesita_sudo() {  # $1 ruta → imprime "sudo -n" o nada
+  local p=$1
+  [ $ES_ROOT = 1 ] && return 0
+  while [ ! -e "$p" ] && [ "$p" != / ]; do p=$(dirname "$p"); done
+  [ -w "$p" ] || echo "sudo -n"
+}
+
+# systemctl que cambia algo: sudo -n si no somos root; NO_SYSTEMCTL=1 lo salta.
+sc() {
+  if [ "$NO_SYSTEMCTL" = 1 ]; then echo "  [NO_SYSTEMCTL] saltaría: systemctl $*"; return 0; fi
+  if [ $ES_ROOT = 1 ]; then hacer systemctl "$@"; else hacer sudo -n systemctl "$@"; fi
+}
+
+# Lectura (no cambia nada): siempre se consulta, también en dry-run y con NO_SYSTEMCTL.
+activo() {  # $1 unidad → active/inactive/failed/…
+  local s
+  s=$(systemctl is-active "$1" 2>/dev/null)
+  echo "${s:-desconocido}"
+}
+
+# Escribe un archivo con el contenido de stdin. Idempotente: si ya es igual, no lo toca
+# (devuelve 1 = "sin cambios"). Usa sudo -n sólo si hace falta (drop-ins en /etc).
+escribir() {  # $1 ruta, $2 modo
+  local ruta=$1 modo=$2 dir contenido pre tmp
+  dir=$(dirname "$ruta")
+  contenido=$(cat; echo x); contenido=${contenido%x}
+  if [ -f "$ruta" ] && [ "$(cat "$ruta"; echo x)" = "${contenido}x" ]; then
+    return 1
+  fi
+  if [ $DRY = 1 ]; then
+    echo "  [dry-run] escribiría $ruta ($modo):"
+    local nl
+    nl=$(printf '%s' "$contenido" | grep -c '')
+    printf '%s' "$contenido" | head -n 12 | sed 's/^/      │ /'
+    [ "$nl" -gt 12 ] && echo "      │ … ($((nl - 12)) líneas más)"
+    return 0
+  fi
+  pre=$(necesita_sudo "$ruta")
+  $pre mkdir -p "$dir" || return 2
+  tmp="$ruta.tmp.$$"
+  printf '%s' "$contenido" | $pre tee "$tmp" >/dev/null || return 2
+  $pre chmod "$modo" "$tmp" && $pre mv -f "$tmp" "$ruta" || { $pre rm -f "$tmp"; return 2; }
+  return 0
+}
+
+# Reemplaza {{NOMBRE}} y {{DUENO}} (sin que & ni / del nombre del dueño rompan nada).
+rellenar() {  # stdin → stdout; $1 nombre, $2 dueño
+  local t
+  t=$(cat; echo x); t=${t%x}
+  t=${t//'{{NOMBRE}}'/"$1"}
+  t=${t//'{{DUENO}}'/"$2"}
+  printf '%s' "$t"
+}
+
+# Lee un campo de un JSON (python3 de la stdlib; vacío si no existe o no se puede leer).
+json_campo() {  # $1 archivo, $2 campo
+  [ -r "$1" ] || return 0
+  python3 -I -c '
+import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get(sys.argv[2], "")
+except Exception:
+    v = ""
+print(v if v is not None else "")' "$1" "$2"
+}
+
+# Agentes reales: carpetas (no symlinks) en AGENTES_DIR con agente.env — igual que el engine.
+agentes() {
+  local d n
+  [ -d "$AGENTES_DIR" ] || return 0
+  for d in "$AGENTES_DIR"/*/; do
+    d=${d%/}
+    [ -d "$d" ] && [ ! -L "$d" ] && [ -f "$d/agente.env" ] || continue
+    n=$(basename "$d")
+    case " $RESERVADOS " in *" $n "*) continue ;; esac
+    echo "$n"
+  done
+}
+
+# Resuelve un nombre → UNIDAD, STATE, CARPETA. Zoro también vale (sólo lectura/pausa).
+resolver() {  # $1 nombre
+  local n=$1
+  if [ "$n" = zoro ]; then
+    UNIDAD=zoro; STATE=$ZORO_STATE; CARPETA=$AGENTES_DIR/zoro
+    return 0
+  fi
+  [[ $n =~ $NOMBRE_RE ]] || muere "nombre inválido: «$n»"
+  [ -f "$AGENTES_DIR/$n/agente.env" ] && [ ! -L "$AGENTES_DIR/$n" ] || muere "no existe el agente «$n» ($AGENTES_DIR/$n/agente.env)"
+  UNIDAD=zoro@$n; STATE=$AGENTES_DIR/$n/engine/state; CARPETA=$AGENTES_DIR/$n
+}
+
+dropin_dir() { echo "$SYSTEMD_DIR/zoro@$1.service.d"; }
+
+# --- aislar ------------------------------------------------------------------------------------
+# Escribe aislamiento.conf de cada agente con los DEMÁS agentes como InaccessiblePaths.
+# Nunca escribe "InaccessiblePaths=" vacío: eso borraría también la lista de la unidad (.secrets…).
+# Devuelve 0 si cambió algo (hay que hacer daemon-reload), 1 si todo estaba igual.
+aislar_todo() {
+  local lista a o otros desc cambio=1 r
+  lista=$(agentes)
+  for a in $lista; do
+    otros=""
+    for o in $lista; do
+      [ "$o" = "$a" ] || otros="$otros -$AGENTES_DIR/$o"
+    done
+    {
+      echo "# Generado por zoro-agente aislar — no editar a mano (se reescribe en cada alta/baja)."
+      echo "# Los demás sub-agentes no existen para zoro@$a (capa 3, kernel)."
+      echo "[Service]"
+      if [ -n "$otros" ]; then echo "InaccessiblePaths=${otros# }"; fi
+    } | escribir "$(dropin_dir "$a")/aislamiento.conf" 644
+    r=$?
+    desc=${otros# }; desc=${desc:-sin otros agentes}
+    case $r in
+      0) echo "  aislamiento zoro@$a: $([ $DRY = 1 ] && echo 'cambiaría' || echo 'actualizado') ($desc)"; cambio=0 ;;
+      1) echo "  aislamiento zoro@$a: sin cambios" ;;
+      *) aviso "no pude escribir el aislamiento de zoro@$a" ;;
+    esac
+  done
+  [ -z "$lista" ] && echo "  (no hay agentes en $AGENTES_DIR)"
+  return $cambio
+}
+
+cmd_aislar() {
+  paso "Aislamiento (drop-ins en $SYSTEMD_DIR)"
+  if aislar_todo; then
+    sc daemon-reload
+  else
+    echo "  nada cambió: no hace falta daemon-reload"
+  fi
+}
+
+# --- nuevo -------------------------------------------------------------------------------------
+cmd_nuevo() {
+  local n="" dueno="" bot="" plantilla="" modelo=claude-sonnet-5-5 esfuerzo=medium
+  local nombre_dueno="" espejo="" memoria=1500M con_sudo=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --dueño|--dueno)               dueno=${2:-}; shift 2 ;;
+      --bot)                         bot=${2:-}; shift 2 ;;
+      --plantilla)                   plantilla=${2:-}; shift 2 ;;
+      --modelo)                      modelo=${2:-}; shift 2 ;;
+      --esfuerzo)                    esfuerzo=${2:-}; shift 2 ;;
+      --nombre-dueño|--nombre-dueno) nombre_dueno=${2:-}; shift 2 ;;
+      --espejo)                      espejo=${2:-}; shift 2 ;;
+      --memoria)                     memoria=${2:-}; shift 2 ;;
+      --sudo)                        con_sudo=1; shift ;;
+      -*)                            muere "opción desconocida para nuevo: $1 (ver: zoro-agente ayuda)" ;;
+      *) [ -z "$n" ] || muere "sobra el argumento «$1»"; n=$1; shift ;;
+    esac
+  done
+
+  # Validaciones (antes de tocar nada)
+  [ -n "$n" ] || muere "falta el nombre: zoro-agente nuevo <n> --dueño <id> --bot <token> --plantilla familia|dev"
+  [[ $n =~ $NOMBRE_RE ]] || muere "nombre inválido «$n»: minúsculas, dígitos y guiones, empieza con letra, 2-21 caracteres"
+  case " $RESERVADOS " in *" $n "*) muere "«$n» es un nombre reservado" ;; esac
+  [ -e "$AGENTES_DIR/$n" ] || [ -L "$AGENTES_DIR/$n" ] && muere "ya existe $AGENTES_DIR/$n"
+  [[ $dueno =~ ^[0-9]+(,[0-9]+)*$ ]] || muere "--dueño debe ser uno o más IDs numéricos de Telegram separados por coma"
+  [[ $bot =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || muere "--bot no parece un token de BotFather (123456:ABC…)"
+  [ -n "$plantilla" ] || muere "falta --plantilla familia|dev"
+  [ -f "$PLANTILLAS_DIR/$plantilla/soul.md" ] || muere "no existe la plantilla «$plantilla» ($PLANTILLAS_DIR/$plantilla/soul.md)"
+  [[ $modelo =~ ^[A-Za-z0-9._:-]+$ ]] || muere "--modelo inválido: «$modelo»"
+  case $esfuerzo in low|medium|high|xhigh|max) ;; *) muere "--esfuerzo debe ser low|medium|high|xhigh|max" ;; esac
+  [ -z "$espejo" ] || [[ $espejo =~ ^-?[0-9]+(,-?[0-9]+)*$ ]] || muere "--espejo debe ser uno o más chat_id numéricos"
+  [[ $memoria =~ ^[0-9]+[KMG]$ ]] || muere "--memoria debe ser como 1500M o 2G"
+  [[ $nombre_dueno != *[$'\n'\"\\\$\`]* ]] || muere "--nombre-dueño no puede llevar comillas, \\, \$, \` ni saltos de línea"
+  if [ -z "$nombre_dueno" ]; then
+    [ "$plantilla" = familia ] && muere "la plantilla familia necesita --nombre-dueño \"Nombre\" (así le habla el agente)"
+    nombre_dueno=rafiña
+    aviso "sin --nombre-dueño: uso «rafiña»"
+  fi
+  [ -x "$ZORO_BIN" ] || muere "no encuentro el binario del engine: $ZORO_BIN (falta /redeploy o make build)"
+  # La unidad pasa el token por archivo (TELEGRAM_BOT_TOKEN_FILE): un binario de antes del 11-oct no lo entiende
+  # y se quedaría en un ciclo de reinicios con "TELEGRAM_BOT_TOKEN is required".
+  LC_ALL=C grep -aq TELEGRAM_BOT_TOKEN_FILE "$ZORO_BIN" ||
+    muere "$ZORO_BIN es viejo (no entiende TELEGRAM_BOT_TOKEN_FILE): compílalo primero (/redeploy o make build en ~/zoro)"
+  [ -f "$SETTINGS_AGENTE" ] || muere "no encuentro $SETTINGS_AGENTE"
+  local claude_real
+  claude_real=$(readlink -f "$CLAUDE_LINK" 2>/dev/null)
+  if [ ! -x "$claude_real" ] || [ -d "$claude_real" ]; then
+    # shellcheck disable=SC2012  # nombres de versión (2.1.296), sin espacios
+    claude_real=$(ls -1 "$CLAUDE_VERSIONS" 2>/dev/null | sort -V | tail -1)
+    claude_real=${claude_real:+$CLAUDE_VERSIONS/$claude_real}
+  fi
+  [ -n "$claude_real" ] && [ -x "$claude_real" ] || muere "no encuentro el CLI de Claude ($CLAUDE_LINK / $CLAUDE_VERSIONS)"
+
+  # MemoryHigh ≈ 80 % de MemoryMax (en MiB)
+  local num=${memoria%?} unidad=${memoria: -1} kib high
+  case $unidad in K) kib=$num ;; M) kib=$((num * 1024)) ;; G) kib=$((num * 1048576)) ;; esac
+  high=$((kib * 8 / 10 / 1024))M
+  [ $((kib / 1024)) -ge 256 ] || muere "--memoria $memoria es muy poca (mínimo 256M)"
+
+  local D=$AGENTES_DIR/$n
+  echo "== Nuevo agente «$n» ($plantilla · $modelo/$esfuerzo · dueño $nombre_dueno $dueno)$([ $DRY = 1 ] && echo ' — dry-run') =="
+
+  # Si algo falla a medio camino, se borra la carpeta a medias (no existía antes).
+  local creada=0
+  limpiar() {
+    if [ $creada = 1 ] && [ $DRY = 0 ]; then
+      aviso "falló la creación: borro $D a medias"
+      rm -rf -- "$D"
+    fi
+    muere "$1"
+  }
+
+  # 1. Carpeta y estructura
+  paso "Carpeta $D (711)"
+  hacer mkdir -p "$AGENTES_DIR" || muere "no pude crear $AGENTES_DIR"
+  hacer install -d -m 711 "$D" || muere "no pude crear $D"
+  creada=1
+  local sub
+  for sub in notas work bin .local/bin engine/state engine/inbox engine/outbox; do
+    hacer mkdir -p "$D/$sub" || limpiar "no pude crear $D/$sub"
+  done
+  hacer install -d -m 700 "$D/.claude" || limpiar "no pude crear .claude"
+
+  # agente.env: config del engine, SIN el token (llega por LoadCredential=bot:)
+  local pausa_txt regreso_txt
+  if [ "$plantilla" = familia ]; then
+    pausa_txt="$nombre_dueno, ando en pausa un ratito 😴 Tu mensaje ya quedó guardado y te contesto en cuanto regrese 💛"
+    regreso_txt="¡Ya regresé, $nombre_dueno! ☀️ Ahorita veo lo que me mandaste y seguimos 💛"
+  else
+    pausa_txt="⏸️ Ando en pausa un rato. Tu mensaje quedó guardado y lo retomo en cuanto regrese."
+    regreso_txt="▶️ ¡De vuelta! Retomo lo que me mandaste y seguimos."
+  fi
+  {
+    echo "# agente.env de $n — lo lee zoro@$n.service (EnvironmentFile). Generado por zoro-agente $(date +%Y-%m-%d)."
+    echo "# Aquí NO van secretos: el token del bot llega por LoadCredential (ver zoro@.service)."
+    echo "TELEGRAM_OWNER_ID=$dueno"
+    echo "ZORO_AGENT_NAME=$n"
+    echo "ZORO_OWNER_NAME=\"$nombre_dueno\""
+    echo "CLAUDE_BIN=$D/bin/claude-strict"
+    echo "CLAUDE_MODEL=$modelo"
+    echo "ZORO_EFFORT=$esfuerzo"
+    echo "ZORO_WORK_DIR=$D/work"
+    echo "ZORO_HOME=$D"
+    echo "ZORO_STATE_DIR=$D/engine/state"
+    echo "ZORO_INBOX_DIR=$D/engine/inbox"
+    echo "ZORO_OUTBOX_DIR=$D/engine/outbox"
+    echo "ZORO_DANGER_SKIP=true"
+    echo "ZORO_MAX_FILE_BYTES=20971520"
+    echo "FFMPEG_BIN=ffmpeg"
+    echo "WHISPER_BIN=$WHISPER_BIN"
+    echo "WHISPER_MODEL=$WHISPER_MODEL"
+    echo "WHISPER_LANG=es"
+    echo "ZORO_PAUSE_REPLY=\"$pausa_txt\""
+    echo "ZORO_RESUME_REPLY=\"$regreso_txt\""
+    if [ -n "$espejo" ]; then echo "ZORO_MIRROR_CHAT_ID=$espejo"; fi
+  } | escribir "$D/agente.env" 600
+  [ $? -le 1 ] || limpiar "no pude escribir agente.env"
+
+  # Vault: soul, context, notas, historia, tasks, crons (cierre.md sólo si la plantilla lo trae)
+  paso "Vault desde la plantilla «$plantilla»"
+  rellenar "$n" "$nombre_dueno" <"$PLANTILLAS_DIR/$plantilla/soul.md" | escribir "$D/soul.md" 644
+  [ $? -le 1 ] || limpiar "no pude escribir soul.md"
+  if [ -f "$PLANTILLAS_DIR/$plantilla/context.md" ]; then
+    rellenar "$n" "$nombre_dueno" <"$PLANTILLAS_DIR/$plantilla/context.md"
+  else
+    printf '# %s — contexto de %s\n\nÍndice corto. Lo detallado va en `notas/*.md`.\n\n## Estado vivo\n- %s: recién creado.\n' \
+      "$nombre_dueno" "$n" "$(date +%d-%b-%Y)"
+  fi | escribir "$D/context.md" 644
+  if [ -f "$PLANTILLAS_DIR/$plantilla/cierre.md" ]; then
+    rellenar "$n" "$nombre_dueno" <"$PLANTILLAS_DIR/$plantilla/cierre.md" | escribir "$D/cierre.md" 644
+  fi
+  printf '# Historia de %s\n\n- %s: creado con zoro-agente (plantilla %s).\n' "$n" "$(date +%Y-%m-%d)" "$plantilla" |
+    escribir "$D/historia.md" 644
+  printf '{\n  "tasks": []\n}\n' | escribir "$D/tasks.json" 644
+  printf '{\n  "timezone": "America/Mexico_City",\n  "crons": []\n}\n' | escribir "$D/crons.json" 644
+
+  # Engine: binario propio (su /redeploy y el nocturno lo actualizan) + settings del state
+  paso "Engine (copia de $ZORO_BIN) y state/settings.json"
+  hacer install -m 755 "$ZORO_BIN" "$D/engine/zoro" || limpiar "no pude copiar el binario"
+  printf '{\n  "model": "%s",\n  "effort": "%s"\n}\n' "$modelo" "$esfuerzo" | escribir "$D/engine/state/settings.json" 644
+
+  # Claude: config propia (hook guardia + deny), onboarding hecho, CLI y claude-strict
+  paso "Claude (.claude/, CLI → $claude_real, bin/claude-strict)"
+  escribir "$D/.claude/settings.json" 644 <"$SETTINGS_AGENTE"
+  printf '{\n  "hasCompletedOnboarding": true\n}\n' | escribir "$D/.claude/.claude.json" 600
+  hacer ln -sfn "$claude_real" "$D/.local/bin/claude"
+  printf '#!/bin/sh\n# Claude sin MCP (los sub-agentes no usan conectores; el hook bloquea mcp__* igual).\nexec "$HOME/.local/bin/claude" --strict-mcp-config "$@"\n' |
+    escribir "$D/bin/claude-strict" 755
+
+  # Atajos con los nombres del brief
+  hacer ln -sfn .claude "$D/claude"
+  for sub in state inbox outbox; do
+    hacer ln -sfn "engine/$sub" "$D/$sub"
+  done
+
+  if [ $ES_ROOT = 1 ]; then
+    hacer chown -hR "$AGENTE_USER:$AGENTE_USER" "$D"
+  fi
+
+  # 2. Token del bot (fuera de la carpeta del agente)
+  paso "Token del bot → $SECRETS_DIR/bots/$n.token (dir 700, archivo 600)"
+  if [ $DRY = 1 ]; then
+    echo "  [dry-run] guardaría el token (no se imprime)"
+  else
+    install -d -m 700 "$SECRETS_DIR/bots" || limpiar "no pude crear $SECRETS_DIR/bots"
+    (umask 077; printf '%s\n' "$bot" >"$SECRETS_DIR/bots/$n.token") || limpiar "no pude guardar el token"
+    chmod 600 "$SECRETS_DIR/bots/$n.token"
+    [ $ES_ROOT = 1 ] && chown -R "$AGENTE_USER:$AGENTE_USER" "$SECRETS_DIR/bots"
+  fi
+  creada=0   # de aquí en adelante la carpeta ya está completa: no se borra si falla systemd
+
+  # 3. Drop-ins de la instancia
+  paso "Drop-ins de zoro@$n ($(dropin_dir "$n"))"
+  {
+    echo "# Generado por zoro-agente nuevo — límites de zoro@$n."
+    echo "[Service]"
+    echo "MemoryMax=$memoria"
+    echo "MemoryHigh=$high"
+    if [ $con_sudo = 1 ]; then
+      echo "# --sudo: conserva NoNewPrivileges=false de la unidad (sudo filtrado por guardia.json)."
+    else
+      echo "NoNewPrivileges=yes"
+    fi
+  } | escribir "$(dropin_dir "$n")/limites.conf" 644
+  [ $? -le 1 ] || muere "no pude escribir limites.conf (¿sudo -n?)"
+  aislar_todo
+  if [ $DRY = 1 ] && ! printf '%s\n' "$(agentes)" | grep -qx "$n"; then
+    # en dry-run el agente aún no existe: así quedaría su aislamiento y el de los demás
+    local o otros=""
+    for o in $(agentes); do otros="$otros -$AGENTES_DIR/$o"; done
+    echo "  [dry-run] aislamiento zoro@$n: $( [ -n "$otros" ] && echo "InaccessiblePaths=${otros# }" || echo "sin otros agentes") (y $n se sumaría al de los demás)"
+  fi
+
+  # 4. systemd
+  paso "systemd: daemon-reload + enable --now zoro@$n"
+  sc daemon-reload
+  sc enable --now "zoro@$n" || aviso "enable --now zoro@$n falló — revisa: journalctl -u zoro@$n -n 50"
+
+  # 5. Recordatorios
+  echo
+  echo "Recordatorios:"
+  echo "  · Respaldo: backup-all descubre ~/agentes/* solo — no hay que tocarlo."
+  echo "  · Vigía: watch-agent-health descubre los agentes solo — no hay que tocarlo."
+  [ $con_sudo = 1 ] && echo "  · --sudo: agrega sus comandos permitidos a ~/agentes/bin/guardia.json (\"$n\": [regex…]); sin eso el guardia bloquea todo sudo."
+  [ -z "$espejo" ] && echo "  · Sin --espejo: nadie ve sus turnos además del dueño (ZORO_MIRROR_CHAT_ID en agente.env)."
+  echo
+  if [ $DRY = 0 ] && [ "$NO_SYSTEMCTL" != 1 ]; then
+    sleep 3
+    cmd_estado "$n"
+    echo
+  fi
+  echo "✅ Listo$([ $DRY = 1 ] && echo ' (dry-run: no se tocó nada)'). Falta UNA cosa: desde el Telegram del dueño ($dueno) manda /start al bot."
+}
+
+# --- listar ------------------------------------------------------------------------------------
+cmd_listar() {
+  local n mod esf pausa
+  if [ -L "$AGENTES_DIR/zoro" ] || [ -d "$ZORO_STATE" ]; then
+    pausa=""; [ -e "$ZORO_STATE/paused" ] && pausa="  ⏸ pausado"
+    printf '%-14s %-22s %-10s %s%s\n' "zoro" "(zoro.service)" "$(activo zoro)" \
+      "$(json_campo "$ZORO_STATE/settings.json" model)/$(json_campo "$ZORO_STATE/settings.json" effort)" "$pausa"
+  fi
+  local hay=0
+  for n in $(agentes); do
+    hay=1
+    local st=$AGENTES_DIR/$n/engine/state
+    mod=$(json_campo "$st/settings.json" model); esf=$(json_campo "$st/settings.json" effort)
+    pausa=""; [ -e "$st/paused" ] && pausa="  ⏸ pausado ($(json_campo "$st/paused" reason))"
+    printf '%-14s %-22s %-10s %s%s\n' "$n" "(zoro@$n)" "$(activo "zoro@$n")" "${mod:-?}/${esf:-?}" "$pausa"
+  done
+  [ $hay = 1 ] || echo "(no hay sub-agentes en $AGENTES_DIR)"
+}
+
+# --- estado ------------------------------------------------------------------------------------
+estado_uno() {  # $1 nombre, $2 1=du
+  resolver "$1"
+  local razon pend ult mod esf j
+  echo "== $1 ($UNIDAD) =="
+  echo "  activo:     $(activo "$UNIDAD")"
+  if [ -e "$STATE/paused" ]; then
+    razon=$(json_campo "$STATE/paused" reason)
+    j="  pausa:      sí — ${razon:-stop} desde $(json_campo "$STATE/paused" since)"
+    [ -n "$(json_campo "$STATE/paused" resets)" ] && j="$j · se renueva $(json_campo "$STATE/paused" resets)"
+    [ -n "$(json_campo "$STATE/paused" detail)" ] && j="$j · $(json_campo "$STATE/paused" detail)"
+    echo "$j"
+  else
+    echo "  pausa:      no"
+  fi
+  pend=0
+  [ -f "$STATE/pending.jsonl" ] && pend=$(grep -c . "$STATE/pending.jsonl")
+  echo "  pendientes: $pend"
+  mod=$(json_campo "$STATE/settings.json" model); esf=$(json_campo "$STATE/settings.json" effort)
+  echo "  modelo:     ${mod:-?} · esfuerzo ${esf:-?}"
+  ult=$(json_campo "$STATE/state.json" updated_at)
+  echo "  último turno: ${ult:-nunca}"
+  if [ "$2" = 1 ]; then
+    echo "  tamaño:     $(du -sh "$(readlink -f "$CARPETA")" 2>/dev/null | cut -f1)"
+  fi
+  echo "  journal (últimas 5):"
+  local pre=""
+  [ $ES_ROOT = 1 ] || pre="sudo -n"
+  local jr
+  jr=$($pre journalctl -u "$UNIDAD" -n 5 --no-pager -q 2>/dev/null)
+  if [ -n "$jr" ]; then printf '%s\n' "$jr" | sed 's/^/    /'; else echo "    (sin entradas)"; fi
+}
+
+cmd_estado() {
+  local du=0 n="" a
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --du) du=1 ;;
+      -*) muere "opción desconocida para estado: $1" ;;
+      *) n=$1 ;;
+    esac
+    shift
+  done
+  if [ -n "$n" ]; then
+    estado_uno "$n" $du
+    return
+  fi
+  for a in $(agentes); do estado_uno "$a" $du; echo; done
+}
+
+# --- pausar / reanudar -------------------------------------------------------------------------
+# Misma bandera que /stop de Zoro (internal/bot/pause.go, struct pauseFlag), pero para uno solo.
+# El engine la revisa antes de cada llamada a Claude; al quitarla, en ≤30 s manda un turno con lo pendiente.
+cmd_pausar() {
+  [ $# = 1 ] || muere "uso: zoro-agente pausar <n>"
+  resolver "$1"
+  if [ -e "$STATE/paused" ]; then
+    echo "«$1» ya estaba pausado ($(json_campo "$STATE/paused" reason) desde $(json_campo "$STATE/paused" since)) — no lo toco"
+    return 0
+  fi
+  [ -d "$STATE" ] || muere "no existe $STATE"
+  printf '{\n  "since": "%s",\n  "reason": "stop",\n  "detail": "zoro-agente pausar (VPS)",\n  "agent": "%s"\n}' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" | escribir "$STATE/paused" 644
+  [ $? -le 1 ] || muere "no pude escribir $STATE/paused"
+  echo "⏸ «$1» $([ $DRY = 1 ] && echo 'quedaría' || echo 'quedó') pausado: no llama a Claude; los mensajes del dueño se guardan en pending.jsonl."
+}
+
+cmd_reanudar() {
+  [ $# = 1 ] || muere "uso: zoro-agente reanudar <n>"
+  resolver "$1"
+  if [ ! -e "$STATE/paused" ]; then
+    echo "«$1» no estaba pausado"
+    return 0
+  fi
+  local razon pend=0
+  razon=$(json_campo "$STATE/paused" reason)
+  [ "$razon" = limit ] && aviso "la pausa era por el LÍMITE de Claude ($(json_campo "$STATE/paused" resets)); si sigue agotado, se vuelve a pausar solo"
+  hacer rm -f "$STATE/paused" || muere "no pude borrar $STATE/paused"
+  [ -f "$STATE/pending.jsonl" ] && pend=$(grep -c . "$STATE/pending.jsonl")
+  echo "▶️ «$1» $([ $DRY = 1 ] && echo 'se reanudaría' || echo 'reanudado') · $pend mensaje(s) pendiente(s) (los contesta en un turno, en ≤30 s)."
+}
+
+# --- borrar ------------------------------------------------------------------------------------
+cmd_borrar() {
+  local n="" si=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --si|--sí) si=1 ;;
+      -*) muere "opción desconocida para borrar: $1" ;;
+      *) n=$1 ;;
+    esac
+    shift
+  done
+  [ -n "$n" ] || muere "uso: zoro-agente borrar <n> [--si]"
+  [ "$n" = zoro ] && muere "a Zoro no se le borra con esto"
+  resolver "$n"
+  local D=$AGENTES_DIR/$n fecha arch
+  fecha=$(date +%Y%m%d-%H%M)
+  arch=$RESPALDOS_DIR/$n-$fecha.tgz
+  if [ $si = 0 ] && [ $DRY = 0 ]; then
+    echo "Esto para zoro@$n, archiva $D en $arch y BORRA la carpeta, su token y sus drop-ins."
+    local resp
+    read -r -p "Escribe el nombre del agente para confirmar: " resp
+    [ "$resp" = "$n" ] || muere "cancelado"
+  fi
+  echo "== Borrar «$n»$([ $DRY = 1 ] && echo ' — dry-run') =="
+  paso "Parar y deshabilitar zoro@$n"
+  sc disable --now "zoro@$n" || aviso "disable --now falló (¿ya estaba parado?) — sigo"
+  paso "Archivo → $arch"
+  hacer mkdir -p "$RESPALDOS_DIR" || muere "no pude crear $RESPALDOS_DIR"
+  hacer tar --one-file-system --exclude="$n/.cache" -czf "$arch" -C "$AGENTES_DIR" "$n" ||
+    muere "tar falló: NO borro nada (la unidad quedó parada; enable --now zoro@$n para regresarla)"
+  [ $DRY = 1 ] || echo "  $(du -h "$arch" | cut -f1) archivado"
+  paso "Borrar carpeta, token y drop-ins"
+  case $D in "$AGENTES_DIR"/?*) ;; *) muere "ruta rara: $D" ;; esac
+  hacer rm -rf -- "$D" || muere "no pude borrar $D"
+  hacer rm -f "$SECRETS_DIR/bots/$n.token"
+  local dd pre
+  dd=$(dropin_dir "$n")
+  if [ -d "$dd" ]; then
+    pre=$(necesita_sudo "$dd")
+    # shellcheck disable=SC2086  # $pre es "sudo -n" o nada: se parte a propósito
+    hacer $pre rm -rf -- "$dd"
+  fi
+  paso "Aislamiento de los que quedan"
+  aislar_todo
+  sc daemon-reload
+  sc reset-failed "zoro@$n" 2>/dev/null
+  echo "🗑 «$n» $([ $DRY = 1 ] && echo 'se borraría' || echo 'borrado') · respaldo: $arch"
+}
+
+# --- ayuda -------------------------------------------------------------------------------------
+cmd_ayuda() {
+  cat <<EOF
+zoro-agente — sub-agentes de Zoro (zoro@<n>.service, carpeta $AGENTES_DIR/<n>)
+
+  nuevo <n> --dueño <id>[,id2] --bot <token> --plantilla familia|dev
+        [--modelo claude-sonnet-5-5] [--esfuerzo medium] [--nombre-dueño "Nombre"]
+        [--espejo <chat_id>] [--memoria 1500M] [--sudo]
+        Crea la carpeta, guarda el token, escribe drop-ins, re-aísla a todos y arranca la unidad.
+  listar                  Una línea por agente con su estado (is-active), modelo y pausa.
+  estado [n] [--du]       Activo, pausa, pendientes, modelo, último turno, journal (y tamaño con --du).
+  pausar <n>              Pausa sólo a ese agente (como /stop de Zoro, pero uno).
+  reanudar <n>            Quita la pausa; contesta lo pendiente en un turno.
+  borrar <n> [--si]       Para, archiva en $RESPALDOS_DIR/<n>-<fecha>.tgz y borra todo.
+  aislar                  Regenera aislamiento.conf de todos (idempotente) + daemon-reload si cambió.
+  ayuda                   Esto.
+
+  --dry-run (global): imprime lo que haría sin tocar nada.
+  Variables: AGENTES_DIR SYSTEMD_DIR SECRETS_DIR RESPALDOS_DIR ZORO_BIN PLANTILLAS_DIR NO_SYSTEMCTL=1
+EOF
+}
+
+# --- main --------------------------------------------------------------------------------------
+cmd=${1:-ayuda}
+[ $# -gt 0 ] && shift
+case $cmd in
+  nuevo)                 cmd_nuevo "$@" ;;
+  listar|lista|ls)       cmd_listar "$@" ;;
+  estado|status)         cmd_estado "$@" ;;
+  pausar)                cmd_pausar "$@" ;;
+  reanudar)              cmd_reanudar "$@" ;;
+  borrar)                cmd_borrar "$@" ;;
+  aislar)                cmd_aislar "$@" ;;
+  ayuda|help|-h|--help)  cmd_ayuda ;;
+  *) cmd_ayuda >&2; echo >&2; muere "subcomando desconocido: $cmd" ;;
+esac

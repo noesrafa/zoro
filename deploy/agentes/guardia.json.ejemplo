@@ -1,0 +1,13 @@
+{
+  "_comentario": "sudo permitido por agente (regex de comando completo, sin redirecciones). Lo lee guardia.py; vive en ~/agentes/bin/guardia.json (sólo lectura para los agentes).",
+  "sudo": {
+    "sky": [
+      "sudo( -n)? (/usr/local/bin/)?grug-publish (deploy|update|remove|logs|weburl|list)( [a-z][a-z0-9-]{1,30})?",
+      "sudo( -n)? (/usr/bin/)?systemctl (restart|status|is-active) woods(\\.service)?( --no-pager)?"
+    ],
+    "tequila": [
+      "sudo( -n)? (/usr/local/bin/)?grug-publish (deploy|update|remove|logs|list)( [a-z][a-z0-9-]{1,30})?"
+    ],
+    "rinzler": []
+  }
+}

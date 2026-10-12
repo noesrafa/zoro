@@ -27,7 +27,31 @@ ENGINE=/home/rafael/zoro
 BIN=$ENGINE/bin/zoro
 LOG=$ENGINE/state/actualizar.log
 GO=/usr/local/go/bin/go
-AGENTES="sky tequila rinzler"            # unix user == unit == /home/<user>/engine/zoro
+# Dos esquemas (11-oct-2026, la mudanza a un solo usuario):
+#   viejo: usuario unix == unit == /home/<u>/engine/zoro (sky, tequila, rinzler mientras existan)
+#   nuevo: /home/rafael/agentes/<n>/agente.env → unit zoro@<n>, binario <carpeta>/engine/zoro, todo de rafael
+AGENTES_DIR=/home/rafael/agentes
+AGENTES=""
+for d in "$AGENTES_DIR"/*/; do
+  d=${d%/}; [ -L "$d" ] && continue; [ -f "$d/agente.env" ] && AGENTES="$AGENTES $(basename "$d")"
+done
+for u in sky tequila rinzler; do
+  case " $AGENTES " in *" $u "*) continue;; esac
+  [ -d "/home/$u/engine" ] && AGENTES="$AGENTES $u"
+done
+AGENTES=${AGENTES# }
+nuevo() { [ -f "$AGENTES_DIR/$1/agente.env" ]; }
+unit_de() { if nuevo "$1"; then echo "zoro@$1"; else echo "$1"; fi; }
+bin_de() { if nuevo "$1"; then echo "$AGENTES_DIR/$1/engine/zoro"; else echo "/home/$1/engine/zoro"; fi; }
+dueno_de() { if nuevo "$1"; then echo rafael; else echo "$1"; fi; }
+state_de() {
+  local d=""
+  [ "$1" = zoro ] && { echo "$ENGINE/state"; return; }
+  nuevo "$1" && d=$(sed -n 's/^ZORO_STATE_DIR=//p' "$AGENTES_DIR/$1/agente.env" | tail -1)
+  [ -n "$d" ] && { echo "$d"; return; }
+  nuevo "$1" && { echo "$AGENTES_DIR/$1/engine/state"; return; }
+  echo "/home/$1/engine/state"
+}
 HOY=$(date +%Y%m%d)
 DESPERTAR=/home/rafael/.zoro/despertar.sh
 
@@ -57,7 +81,7 @@ despertar() {  # $1 = qué falló
 banderas() {
   local out="" u d
   for u in zoro $AGENTES; do
-    d=/home/$u/engine/state; [ $u = zoro ] && d=$ENGINE/state
+    d=$(state_de "$u")
     [ -e "$d/paused" ] && out="$out $u"
   done
   out=${out# }
@@ -87,8 +111,8 @@ log "pausa antes: $(banderas)"
 # 2. Copiar el binario a los sub-agentes que lo tengan distinto
 declare -A RESPALDO=()
 for u in $AGENTES; do
-  dst=/home/$u/engine/zoro
-  if ! systemctl is-enabled --quiet "$u" 2>/dev/null; then
+  dst=$(bin_de "$u")
+  if ! systemctl is-enabled --quiet "$(unit_de "$u")" 2>/dev/null; then
     log "$u: unit no habilitada — la dejo como está"
     continue
   fi
@@ -98,7 +122,7 @@ for u in $AGENTES; do
   fi
   bak=$dst.bak-$HOY
   hacer cp -p "$dst" "$bak" &&
-    hacer install -o "$u" -g "$u" -m 755 "$BIN" "$dst" || {
+    hacer install -o "$(dueno_de "$u")" -g "$(dueno_de "$u")" -m 755 "$BIN" "$dst" || {
       log "$u: no pude copiar el binario"
       despertar "no pude copiar el binario a $u"
       continue
@@ -112,9 +136,9 @@ for u in $AGENTES; do
 done
 
 # 3. Reiniciar las units habilitadas (sub-agentes primero, Zoro al final)
-UNITS=()
+UNITS=()   # nombres de agente; la unit sale de unit_de
 for u in $AGENTES zoro; do
-  systemctl is-enabled --quiet "$u" 2>/dev/null && UNITS+=("$u")
+  systemctl is-enabled --quiet "$(unit_de "$u")" 2>/dev/null && UNITS+=("$u")
 done
 # Transición (28-sep-2026): un engine de ANTES de la pausa manda "💤 deteniéndose" a su DUEÑO al
 # apagarse — a Lú o a Ángel a las 01:40. El de ahora lo manda al espejo (rafiña). Si el proceso que
@@ -122,8 +146,9 @@ done
 # proceso del cgroup es el engine: ningún claude/whisper en curso) y se apaga con SIGKILL, sin
 # despedida; se borra su state/alive para que el nuevo no avise "revivió". Tras la primera noche ya
 # no aplica: todos corren el binario nuevo.
-viejo_ocioso() {  # $1 unit → 0 si corre un binario viejo y está ocioso (espera hasta 10 min)
+viejo_ocioso() {  # $1 agente → 0 si corre un binario viejo y está ocioso (espera hasta 10 min)
   local pid i
+  nuevo "$1" && return 1   # los zoro@ nacieron con el engine nuevo
   pid=$(systemctl show -p MainPID --value "$1")
   [ "${pid:-0}" != 0 ] || return 1
   grep -qa ZORO_PAUSE_REPLY "/proc/$pid/exe" 2>/dev/null && return 1
@@ -142,19 +167,20 @@ for u in "${UNITS[@]}"; do
     hacer rm -f "/home/$u/engine/state/alive"
   fi
   # reinicio planeado: el engine se salta los avisos "deteniéndose"/"online" (lo borra al arrancar)
-  d=/home/$u/engine/state; [ "$u" = zoro ] && d=$ENGINE/state
+  d=$(state_de "$u")
   hacer install -o "$(stat -c %U "$d")" -m 644 /dev/null "$d/reinicio-nocturno"
-  hacer systemctl restart "$u" || log "$u: systemctl restart falló"
+  hacer systemctl restart "$(unit_de "$u")" || log "$u: systemctl restart falló"
 done
 if [ $DRY = 1 ]; then
-  log "reiniciaría: ${UNITS[*]} · salud: is-active + \"zoro online\" en el journal"
+  log "reiniciaría: $(for u in "${UNITS[@]}"; do printf '%s ' "$(unit_de "$u")"; done)· salud: is-active + \"zoro online\" en el journal"
   log "pausa (se conserva): $(banderas)"
   exit 0
 fi
 
 # 4. Salud
-sano() {  # $1 unit, $2 desde
-  systemctl is-active --quiet "$1" && journalctl -u "$1" --since "$2" --no-pager -q 2>/dev/null | grep -q "zoro online"
+sano() {  # $1 agente, $2 desde
+  local un; un=$(unit_de "$1")
+  systemctl is-active --quiet "$un" && journalctl -u "$un" --since "$2" --no-pager -q 2>/dev/null | grep -q "zoro online"
 }
 esperar_sano() {
   sleep 20
@@ -173,9 +199,9 @@ for u in "${UNITS[@]}"; do
   fi
   if [ -n "${RESPALDO[$u]:-}" ]; then
     log "$u: no levantó con el binario nuevo — restauro $(basename "${RESPALDO[$u]}")"
-    install -o "$u" -g "$u" -m 755 "${RESPALDO[$u]}" "/home/$u/engine/zoro"
+    install -o "$(dueno_de "$u")" -g "$(dueno_de "$u")" -m 755 "${RESPALDO[$u]}" "$(bin_de "$u")"
     otra=$(date '+%Y-%m-%d %H:%M:%S')
-    systemctl restart "$u"
+    systemctl restart "$(unit_de "$u")"
     if esperar_sano "$u" "$otra"; then
       estado="$estado $u RESTAURADO ·"
       despertar "$u no levantó con el binario nuevo; se restauró el respaldo y ya corre"

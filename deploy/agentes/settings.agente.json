@@ -1,0 +1,27 @@
+{
+  "skipDangerousModePermissionPrompt": true,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "python3 /home/rafael/agentes/bin/guardia.py", "timeout": 10 }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "deny": [
+      "Read(//home/rafael/.secrets/**)",
+      "Read(//home/rafael/.zoro/**)",
+      "Read(//home/rafael/.claude/**)",
+      "Read(//home/rafael/trabajos/**)",
+      "Read(//home/rafael/zoro/**)",
+      "Read(//home/rafael/heru/**)",
+      "Read(//home/rafael/respaldos/**)",
+      "Edit(//home/rafael/.secrets/**)",
+      "Edit(//home/rafael/.zoro/**)",
+      "Edit(//home/rafael/zoro/**)"
+    ]
+  }
+}
