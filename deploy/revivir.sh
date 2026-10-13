@@ -72,6 +72,11 @@ token_inicio() {
   tmux new-session -d -s "$TS" -x 250 -y 60 \
     "env -u ANTHROPIC_API_KEY -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=$TCFG $TCLAUDE setup-token" \
     || { echo "ERROR no pude abrir tmux"; exit 1; }
+  # 13-oct: además de leer la pantalla, se guarda la salida CRUDA (por si la pantalla recorta/redibuja el token) y se deja
+  # que «c to copy» (OSC 52) llegue al portapapeles de tmux. Todo en $TCFG (700) y se borra al terminar.
+  : > "$TCFG/crudo.log"; chmod 600 "$TCFG/crudo.log"
+  tmux pipe-pane -t "$TS" -o "cat >> '$TCFG/crudo.log'" 2>/dev/null
+  tmux set -s set-clipboard on 2>/dev/null; tmux set -g allow-passthrough on 2>/dev/null
   tesperar 'oauth/authorize' 30 || { echo "ERROR no salió el link: $(tcola)"; tmux kill-session -t "$TS"; exit 1; }
   sleep 1
   url=$(tpantalla | tr -d '\n' | grep -oE 'https://claude\.com/cai/oauth/authorize[^ ]*state=[A-Za-z0-9_-]+' | head -1)
@@ -90,22 +95,34 @@ probar_token() {
 }
 # extraer_token: lee la pantalla por stdin e imprime el token (pegando las líneas que lo continúan si se partió)
 extraer_token() {
-  # 13-oct: el token puede salir partido en varias líneas Y dentro de una caja (│ … │) → se limpian bordes/espacios antes
-  # de pegar las continuaciones (antes una caja cortaba el pegado y salía «no pude leer el token»).
+  # Lee texto por stdin (pantalla, bitácora cruda o portapapeles) y imprime el token más largo que encuentre.
+  # Quita escapes ANSI/OSC y bordes de caja; pega continuaciones si el token se partió en varias líneas.
   python3 -c '
 import re,sys
-CAJA=re.compile(r"[\s\u2500-\u257f|]")          # espacios + dibujo de cajas (│ ─ ╭ ╮ ╰ ╯ …)
-ls=sys.stdin.read().splitlines()
+x=sys.stdin.buffer.read().decode("utf-8","replace")
+x=re.sub(r"\x1b\][^\x07\x1b]*(\x07|\x1b\\\\)","\n",x)        # OSC (títulos, hipervínculos, portapapeles)
+x=re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]","",x)                          # CSI (colores, cursor)
+x=re.sub(r"\x1b[@-_]","",x); x=re.sub(r"\r+\n","\n",x).replace("\r","\n")
+CAJA=re.compile(r"[\s\u2500-\u257f|]")
+ls=x.splitlines(); mejor=""
 for i,l in enumerate(ls):
-    m=re.search(r"sk-ant-oat\d+-[A-Za-z0-9_-]+",l)
-    if not m: continue
-    t=m.group(0); resto=CAJA.sub("",l[m.end():]); j=i+1
-    if resto=="":                                   # el token llegó al final de su línea (sin contar bordes): puede seguir abajo
-        while j<len(ls):
-            c=CAJA.sub("",ls[j])
-            if not re.fullmatch(r"[A-Za-z0-9_-]+",c or "."): break
-            t+=c; j+=1
-    print(t); break'
+    for m in re.finditer(r"sk-ant-oat\d+-[A-Za-z0-9_-]+",l):
+        t=m.group(0); j=i+1
+        if CAJA.sub("",l[m.end():])=="":
+            while j<len(ls):
+                c=CAJA.sub("",ls[j])
+                if not re.fullmatch(r"[A-Za-z0-9_-]+",c or "."): break
+                t+=c; j+=1
+        if len(t)>len(mejor): mejor=t
+print(mejor)'
+}
+# diagnostico: guarda la FORMA de la pantalla con todo lo que parezca secreto tachado (para depurar sin ver el token)
+diagnostico() {
+  local f=/home/rafael/.cache/zoro-revivir-diag.txt
+  { echo "== pantalla $(date)"; tpantalla; echo "== cola cruda (sin escapes)"; tail -c 6000 "$TCFG/crudo.log" 2>/dev/null | python3 -c '
+import re,sys; x=sys.stdin.buffer.read().decode("utf-8","replace"); print(re.sub(r"\x1b","<ESC>",x))'; } \
+    | python3 -c 'import re,sys; print(re.sub(r"[A-Za-z0-9_-]{20,}", lambda m: "<X%d>"%len(m.group(0)), sys.stdin.read()))' > "$f"
+  chmod 600 "$f"
 }
 token_codigo() {
   local code=$1 tok err
@@ -113,9 +130,17 @@ token_codigo() {
   tmux has-session -t "$TS" 2>/dev/null || { echo "ERROR no hay un setup-token esperando; manda /revivir otra vez"; exit 1; }
   tmux send-keys -t "$TS" -l "$code"; sleep 0.5; tmux send-keys -t "$TS" Enter
   tesperar 'sk-ant-oat[0-9]+-' 45 || { echo "ERROR no salió el token: $(tcola)"; tmux kill-session -t "$TS"; exit 1; }
-  sleep 1
+  sleep 2
   tok=$(tpantalla | extraer_token)
+  if [ ${#tok} -lt 80 ]; then t2=$(extraer_token < "$TCFG/crudo.log"); [ ${#t2} -gt ${#tok} ] && tok=$t2; t2=""; fi
+  if [ ${#tok} -lt 80 ]; then
+    tmux send-keys -t "$TS" c; sleep 1.5
+    t2=$(tmux show-buffer 2>/dev/null | extraer_token); [ ${#t2} -gt ${#tok} ] && tok=$t2; t2=""
+    tmux delete-buffer 2>/dev/null
+  fi
+  [ ${#tok} -ge 80 ] || diagnostico
   tmux kill-session -t "$TS" 2>/dev/null     # se va el scrollback con el token
+  rm -f "$TCFG/crudo.log"
   [ ${#tok} -ge 80 ] || { echo "ERROR no pude leer el token de la pantalla"; exit 1; }
   mkdir -p "$(dirname "$TOKEN")" && chmod 700 "$(dirname "$TOKEN")"
   ( umask 077; printf '%s\n' "$tok" > "$TOKEN.new" )
