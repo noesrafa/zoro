@@ -194,9 +194,6 @@ func Load() (Config, error) {
 	c.Agents = parseAgents(getenv("ZORO_AGENTS", ""))
 	c.AgentsDir = getenv("ZORO_AGENTS_DIR", "")
 	c.ClaudeTokenFile = getenv("ZORO_CLAUDE_TOKEN_FILE", "")
-	if len(c.MirrorChatIDs) > 0 {
-		c.MirrorChatID = c.MirrorChatIDs[0]
-	}
 	c.BriefFile = getenv("ZORO_BRIEF_FILE", filepath.Join(c.StateDir, "brief.md"))
 	c.SoulFile = getenv("ZORO_SOUL_FILE", filepath.Join(c.ZoroHome, "soul.md"))
 	c.ContextFile = getenv("ZORO_CONTEXT_FILE", filepath.Join(c.ZoroHome, "context.md"))
@@ -208,6 +205,7 @@ func Load() (Config, error) {
 	// TELEGRAM_OWNER_ID admite varios IDs separados por coma. El primero es el
 	// "primario" (recibe crons/notify); TODOS pueden hablarle al bot.
 	c.OwnerIDs = map[int64]bool{}
+	var owners []int64 // in the order given: the first is the primary
 	if ids := getenv("TELEGRAM_OWNER_ID", ""); ids != "" {
 		for _, part := range strings.Split(ids, ",") {
 			part = strings.TrimSpace(part)
@@ -221,8 +219,24 @@ func Load() (Config, error) {
 			if c.OwnerID == 0 {
 				c.OwnerID = v
 			}
+			if !c.OwnerIDs[v] {
+				owners = append(owners, v)
+			}
 			c.OwnerIDs[v] = true
 		}
+	}
+
+	// Mirror is ON by default for every sub-agent (13-oct-2026, rafiña): when
+	// ZORO_MIRROR_CHAT_ID is unset, every owner sees the turns of the other owners.
+	// "off" turns it off. Zoro itself never mirrors unless told to.
+	switch {
+	case strings.EqualFold(strings.TrimSpace(os.Getenv("ZORO_MIRROR_CHAT_ID")), "off"):
+		c.MirrorChatIDs = nil
+	case len(c.MirrorChatIDs) == 0 && c.AgentName != "zoro":
+		c.MirrorChatIDs = owners
+	}
+	if len(c.MirrorChatIDs) > 0 {
+		c.MirrorChatID = c.MirrorChatIDs[0]
 	}
 
 	// The bot token can come by reference (TELEGRAM_BOT_TOKEN_FILE, e.g. a systemd
