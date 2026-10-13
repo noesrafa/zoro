@@ -106,6 +106,12 @@ aviso=""
 [ "$(stat -c %Y "$BIN")" -lt "$(git -C "$ENGINE" log -1 --format=%ct 2>/dev/null || echo 0)" ] &&
   aviso=" · ⚠️ bin/zoro es más viejo que el último commit (falta /redeploy)"
 log "preflight: go test ok · bin/zoro $(date -r "$BIN" '+%Y-%m-%d %H:%M')$aviso"
+# 13-oct (agents-core layout): migrated agents run ONE shared slot, bin/zoro-agents, promoted here only after the
+# preflight passed (a broken build Zoro is iterating on never reaches them). The previous slot stays as zoro-agents.prev.
+if [ -f "$ENGINE/bin/zoro-agents" ]; then
+  hacer cp -p "$ENGINE/bin/zoro-agents" "$ENGINE/bin/zoro-agents.prev"
+  hacer install -o rafael -g rafael -m 755 "$BIN" "$ENGINE/bin/zoro-agents" && log "zoro-agents: promovido desde bin/zoro"
+fi
 log "pausa antes: $(banderas)"
 
 # 2. Copiar el binario a los sub-agentes que lo tengan distinto
