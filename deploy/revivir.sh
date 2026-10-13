@@ -90,15 +90,21 @@ probar_token() {
 }
 # extraer_token: lee la pantalla por stdin e imprime el token (pegando las líneas que lo continúan si se partió)
 extraer_token() {
+  # 13-oct: el token puede salir partido en varias líneas Y dentro de una caja (│ … │) → se limpian bordes/espacios antes
+  # de pegar las continuaciones (antes una caja cortaba el pegado y salía «no pude leer el token»).
   python3 -c '
 import re,sys
+CAJA=re.compile(r"[\s\u2500-\u257f|]")          # espacios + dibujo de cajas (│ ─ ╭ ╮ ╰ ╯ …)
 ls=sys.stdin.read().splitlines()
 for i,l in enumerate(ls):
     m=re.search(r"sk-ant-oat\d+-[A-Za-z0-9_-]+",l)
     if not m: continue
-    t=m.group(0); fin=m.end()==len(l.rstrip()); j=i+1
-    while fin and j<len(ls) and re.fullmatch(r"\s*[A-Za-z0-9_-]+\s*",ls[j]):
-        t+=ls[j].strip(); j+=1
+    t=m.group(0); resto=CAJA.sub("",l[m.end():]); j=i+1
+    if resto=="":                                   # el token llegó al final de su línea (sin contar bordes): puede seguir abajo
+        while j<len(ls):
+            c=CAJA.sub("",ls[j])
+            if not re.fullmatch(r"[A-Za-z0-9_-]+",c or "."): break
+            t+=c; j+=1
     print(t); break'
 }
 token_codigo() {
