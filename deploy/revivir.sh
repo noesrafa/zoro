@@ -13,7 +13,7 @@
 # el login por agente queda para Zoro y para los que todavía no se mudan.
 set -uo pipefail
 
-TOKEN=/home/rafael/.secrets/claude.token
+TOKEN=${REVIVIR_TOKEN_FILE:-/home/rafael/.secrets/claude.token}     # (env sólo para pruebas)
 
 usuario() { case "$1" in zoro) echo rafael;; sky) echo sky;; tequila) echo tequila;; rinzler) echo rinzler;; dominio) echo dominio;; *) return 1;; esac; }
 comoU() { sudo -n -u "$U" -i "$@"; }          # login shell de ese usuario (su PATH trae su claude)
@@ -59,8 +59,8 @@ PY
 }
 
 # --- token global (claude setup-token) — corre como rafael, sin sudo -------------------------------
-TS=revivir-token
-TCFG=/home/rafael/.cache/zoro-setup-token     # config dir aparte: setup-token no toca ~/.claude de Zoro
+TS=${REVIVIR_TS:-revivir-token}
+TCFG=${REVIVIR_TCFG:-/home/rafael/.cache/zoro-setup-token}     # config dir aparte: setup-token no toca ~/.claude de Zoro
 TCLAUDE=${TCLAUDE:-/home/rafael/.local/bin/claude}
 tpantalla() { tmux capture-pane -t "$TS" -p -J 2>/dev/null; }
 tesperar() { local fin=$((SECONDS + $2)); while [ $SECONDS -lt $fin ]; do tpantalla | grep -qE "$1" && return 0; sleep 1; done; return 1; }
@@ -101,20 +101,22 @@ extraer_token() {
 import re,sys
 x=sys.stdin.buffer.read().decode("utf-8","replace")
 x=re.sub(r"\x1b\][^\x07\x1b]*(\x07|\x1b\\\\)","\n",x)        # OSC (títulos, hipervínculos, portapapeles)
-x=re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]","",x)                          # CSI (colores, cursor)
+x=re.sub(r"\x1b\[[0-9;]*[CG]"," ",x)                                  # saltos de cursor (Ink los usa en vez de espacios) = espacio
+x=re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]","",x)                          # resto de CSI (colores, borrar línea…)
 x=re.sub(r"\x1b[@-_]","",x); x=re.sub(r"\r+\n","\n",x).replace("\r","\n")
 CAJA=re.compile(r"[\s\u2500-\u257f|]")
-ls=x.splitlines(); mejor=""
+ls=x.splitlines(); cands=set()
 for i,l in enumerate(ls):
     for m in re.finditer(r"sk-ant-oat\d+-[A-Za-z0-9_-]+",l):
-        t=m.group(0); j=i+1
+        t=m.group(0); j=i+1; cands.add(t)
         if CAJA.sub("",l[m.end():])=="":
             while j<len(ls):
-                c=CAJA.sub("",ls[j])
-                if not re.fullmatch(r"[A-Za-z0-9_-]+",c or "."): break
-                t+=c; j+=1
-        if len(t)>len(mejor): mejor=t
-print(mejor)'
+                c=re.sub(r"^[\s\u2500-\u257f|]+|[\s\u2500-\u257f|]+$","",ls[j])   # sólo bordes/espacios de las orillas
+                if not re.fullmatch(r"[A-Za-z0-9_-]+",c or "."): break           # texto con espacios internos = ya no es token
+                t+=c; j+=1; cands.add(t)
+        cands.add(m.group(0))
+for t in sorted(cands,key=len,reverse=True):
+    if len(t)>=80: print(t)'
 }
 # diagnostico: guarda la FORMA de la pantalla con todo lo que parezca secreto tachado (para depurar sin ver el token)
 diagnostico() {
@@ -131,23 +133,24 @@ token_codigo() {
   tmux send-keys -t "$TS" -l "$code"; sleep 0.5; tmux send-keys -t "$TS" Enter
   tesperar 'sk-ant-oat[0-9]+-' 45 || { echo "ERROR no salió el token: $(tcola)"; tmux kill-session -t "$TS"; exit 1; }
   sleep 2
-  tok=$(tpantalla | extraer_token)
-  if [ ${#tok} -lt 80 ]; then t2=$(extraer_token < "$TCFG/crudo.log"); [ ${#t2} -gt ${#tok} ] && tok=$t2; t2=""; fi
-  if [ ${#tok} -lt 80 ]; then
-    tmux send-keys -t "$TS" c; sleep 1.5
-    t2=$(tmux show-buffer 2>/dev/null | extraer_token); [ ${#t2} -gt ${#tok} ] && tok=$t2; t2=""
-    tmux delete-buffer 2>/dev/null
+  C="$TCFG/candidatos"; ( umask 077; : > "$C" )
+  tpantalla | extraer_token >> "$C"; extraer_token < "$TCFG/crudo.log" >> "$C"
+  if [ ! -s "$C" ]; then
+    tmux send-keys -t "$TS" c; sleep 1.5                          # «c to copy» → portapapeles de tmux (OSC 52)
+    tmux show-buffer 2>/dev/null | extraer_token >> "$C"; tmux delete-buffer 2>/dev/null
   fi
-  [ ${#tok} -ge 80 ] || diagnostico
+  [ -s "$C" ] || diagnostico
   tmux kill-session -t "$TS" 2>/dev/null     # se va el scrollback con el token
   rm -f "$TCFG/crudo.log"
-  [ ${#tok} -ge 80 ] || { echo "ERROR no pude leer el token de la pantalla"; exit 1; }
+  [ -s "$C" ] || { echo "ERROR no pude leer el token de la pantalla (dejé un diagnóstico sin secretos para Zoro)"; exit 1; }
   mkdir -p "$(dirname "$TOKEN")" && chmod 700 "$(dirname "$TOKEN")"
-  ( umask 077; printf '%s\n' "$tok" > "$TOKEN.new" )
-  tok=""
-  if ! err=$(probar_token "$TOKEN.new"); then
-    echo "ERROR el token se creó pero la prueba falló (no reemplacé el anterior; quedó en claude.token.new): $err"; exit 1
-  fi
+  ok=""; err=""
+  while IFS= read -r tok; do                 # del más largo al más corto, sin repetir; el primero que Claude acepte
+    ( umask 077; printf '%s\n' "$tok" > "$TOKEN.new" )
+    if err=$(probar_token "$TOKEN.new"); then ok=1; break; fi
+  done < <(awk '!v[$0]++' "$C" | awk '{print length($0), $0}' | sort -rn | cut -d' ' -f2-)
+  tok=""; rm -f "$C"
+  [ -n "$ok" ] || { rm -f "$TOKEN.new"; echo "ERROR el token se leyó pero ninguna lectura pasó la prueba: $err"; exit 1; }
   [ -s "$TOKEN" ] && cp -p "$TOKEN" "$TOKEN.bak-$(date +%Y%m%d-%H%M%S)"
   # en el MISMO inodo (nada de mv): las unidades zoro@ lo ven por un bind de sólo lectura y un archivo nuevo no les llegaría
   ( umask 077; cat "$TOKEN.new" > "$TOKEN" ) && chmod 600 "$TOKEN" && rm -f "$TOKEN.new"
