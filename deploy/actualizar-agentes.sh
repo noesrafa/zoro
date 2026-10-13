@@ -43,10 +43,14 @@ AGENTES=${AGENTES# }
 nuevo() { [ -f "$AGENTES_DIR/$1/agente.env" ]; }
 unit_de() { if nuevo "$1"; then echo "zoro@$1"; else echo "$1"; fi; }
 bin_de() { if nuevo "$1"; then echo "$AGENTES_DIR/$1/engine/zoro"; else echo "/home/$1/engine/zoro"; fi; }
-dueno_de() { if nuevo "$1"; then echo rafael; else echo "$1"; fi; }
+dueno_de() { if nuevo "$1" || ! id -u "$1" >/dev/null 2>&1; then echo rafael; else echo "$1"; fi; }   # 13-oct: users sky/tequila/rinzler deleted → rafael
+CORE=/home/rafael/agents-core
+en_core() { [ -f "$CORE/$1/agent.env" ]; }   # 13-oct: agent on the agents-core layout → runs bin/zoro-agents, its unit is still <name>.service
 state_de() {
   local d=""
   [ "$1" = zoro ] && { echo "$ENGINE/state"; return; }
+  en_core "$1" && d=$(sed -n 's/^ZORO_STATE_DIR=//p' "$CORE/$1/agent.env" | tail -1)
+  [ -n "$d" ] && { echo "$d"; return; }
   nuevo "$1" && d=$(sed -n 's/^ZORO_STATE_DIR=//p' "$AGENTES_DIR/$1/agente.env" | tail -1)
   [ -n "$d" ] && { echo "$d"; return; }
   nuevo "$1" && { echo "$AGENTES_DIR/$1/engine/state"; return; }
@@ -117,6 +121,7 @@ log "pausa antes: $(banderas)"
 # 2. Copiar el binario a los sub-agentes que lo tengan distinto
 declare -A RESPALDO=()
 for u in $AGENTES; do
+  if en_core "$u"; then log "$u: corre bin/zoro-agents (agents-core) — sólo se reinicia"; continue; fi
   dst=$(bin_de "$u")
   if ! systemctl is-enabled --quiet "$(unit_de "$u")" 2>/dev/null; then
     log "$u: unit no habilitada — la dejo como está"
