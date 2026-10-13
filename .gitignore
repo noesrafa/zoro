@@ -19,3 +19,6 @@
 
 # NOTE: prompt/, memory/, skills/, deploy/ ARE tracked on purpose.
 .env.bak*
+
+# private ops scripts (backups, despertar…) — the zoro repo is PUBLIC; ops/ is backed up to R2
+/ops/
