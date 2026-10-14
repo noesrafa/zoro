@@ -37,7 +37,7 @@ SyslogIdentifier=zoro-%i
 # Aislamiento (capa 3; la 1 es el hook guardia.py): lo de rafiña y de Zoro no existe para el agente.
 ProtectHome=false
 InaccessiblePaths=-/home/rafael/.secrets -/home/rafael/.zoro -/home/rafael/.claude -/home/rafael/.claude.json -/home/rafael/.claude-jobs
-InaccessiblePaths=-/home/rafael/trabajos -/home/rafael/heru -/home/rafael/respaldos -/home/rafael/.ssh -/home/rafael/.config/gh -/home/rafael/.git-credentials -/home/rafael/.cache/zoro-setup-token
+InaccessiblePaths=-/home/rafael/trabajos -/home/rafael/work/zoro -/home/rafael/heru -/home/rafael/respaldos -/home/rafael/backups -/home/rafael/.ssh -/home/rafael/.config/gh -/home/rafael/.git-credentials -/home/rafael/.cache/zoro-setup-token
 ReadOnlyPaths=-/home/rafael/zoro -/home/rafael/agentes/bin -/home/rafael/agentes/plantillas
 ReadOnlyPaths=-/home/rafael/agentes/%i/.claude/settings.json -/home/rafael/agentes/%i/agente.env
 # sudo (grug-publish / woods) sólo para quien lo necesita: limites.conf pone NoNewPrivileges=yes a los demás.

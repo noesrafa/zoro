@@ -188,7 +188,7 @@ func Load() (Config, error) {
 	// The quiz site is rafiña's: only Zoro writes there unless an agent sets its own.
 	quizDir := ""
 	if c.AgentName == "zoro" {
-		quizDir = "/home/rafael/dominioartificial/coach"
+		quizDir = "/home/rafael/apps/dominioartificial/coach"
 	}
 	c.QuizDir = getenv("ZORO_QUIZ_DIR", quizDir)
 	c.Agents = parseAgents(getenv("ZORO_AGENTS", ""))

@@ -12,7 +12,7 @@ import (
 // norm() in the quiz page (index.html) vs normQuiz here. Needs node, so it
 // only runs when asked:
 //
-//	ZORO_QUIZ_PAGE=/home/rafael/dominioartificial/coach/index.html go test ./internal/bot -run TestQuizPageNorm
+//	ZORO_QUIZ_PAGE=/home/rafael/apps/dominioartificial/coach/index.html go test ./internal/bot -run TestQuizPageNorm
 func TestQuizPageNorm(t *testing.T) {
 	page := os.Getenv("ZORO_QUIZ_PAGE")
 	if page == "" {

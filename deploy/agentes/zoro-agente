@@ -27,7 +27,7 @@ set -uo pipefail
 AGENTES_DIR=${AGENTES_DIR:-/home/rafael/agentes}
 SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
 SECRETS_DIR=${SECRETS_DIR:-/home/rafael/.secrets}
-RESPALDOS_DIR=${RESPALDOS_DIR:-/home/rafael/respaldos/agentes}
+RESPALDOS_DIR=${RESPALDOS_DIR:-/home/rafael/backups/agentes}
 ZORO_BIN=${ZORO_BIN:-/home/rafael/zoro/bin/zoro}
 ZORO_STATE=${ZORO_STATE:-/home/rafael/zoro/state}      # state de Zoro (sólo para listar/estado/pausar)
 CLAUDE_LINK=${CLAUDE_LINK:-/home/rafael/.local/bin/claude}

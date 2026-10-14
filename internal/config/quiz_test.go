@@ -9,7 +9,7 @@ func TestQuizDirOnlyForZoro(t *testing.T) {
 	t.Setenv("TELEGRAM_BOT_TOKEN", "x")
 	t.Setenv("TELEGRAM_OWNER_ID", "1")
 	t.Setenv("ZORO_QUIZ_DIR", "")
-	for name, want := range map[string]string{"zoro": "/home/rafael/dominioartificial/coach", "sky": "", "tequila": ""} {
+	for name, want := range map[string]string{"zoro": "/home/rafael/apps/dominioartificial/coach", "sky": "", "tequila": ""} {
 		t.Setenv("ZORO_AGENT_NAME", name)
 		c, err := Load()
 		if err != nil {

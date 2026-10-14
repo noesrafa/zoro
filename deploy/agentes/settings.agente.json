@@ -16,9 +16,11 @@
       "Read(//home/rafael/.zoro/**)",
       "Read(//home/rafael/.claude/**)",
       "Read(//home/rafael/trabajos/**)",
+      "Read(//home/rafael/work/zoro/**)",
       "Read(//home/rafael/zoro/**)",
       "Read(//home/rafael/heru/**)",
       "Read(//home/rafael/respaldos/**)",
+      "Read(//home/rafael/backups/**)",
       "Edit(//home/rafael/.secrets/**)",
       "Edit(//home/rafael/.zoro/**)",
       "Edit(//home/rafael/zoro/**)"

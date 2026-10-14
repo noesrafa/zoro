@@ -24,7 +24,7 @@ func TestQuizLiveCycle(t *testing.T) {
 		t.Skip("set ZORO_QUIZ_LIVE=<navegador.js> to run the live PUT cycle")
 	}
 	tb, _ := quizBot(t)
-	tb.cfg.QuizDir = "/home/rafael/dominioartificial/coach"
+	tb.cfg.QuizDir = "/home/rafael/apps/dominioartificial/coach"
 	tb.cfg.QuizURL = "https://coach.dominioartificial.com"
 	before := tb.hub(t)
 	var id string
